@@ -540,8 +540,9 @@ def main():
         gen_len = mb_gen_old.shape[1]
         curr_logps_list = []
         for i in range(full_logps.shape[0]):
+            p_len = prompt_lens[i]
             ans_len = len(mb_ans_token_ids[i])
-            sliced = full_logps[i, prompt_len - 1 : prompt_len - 1 + ans_len]
+            sliced = full_logps[i, p_len - 1 : p_len - 1 + ans_len]
             padded = F.pad(sliced, (0, gen_len - ans_len), value=0.0)
             curr_logps_list.append(padded)
         curr_logps = torch.stack(curr_logps_list, dim=0)
