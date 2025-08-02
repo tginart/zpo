@@ -6,10 +6,12 @@ import numpy as np
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from tqdm import tqdm
+import wandb
+
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 
-model_path = "/data2/Qwen/Qwen2.5-7B"
-gen_device = 4    # GPU device for generation, don't put it in CUDA_VISIBLE_DEVICES
+model_path = "Qwen/Qwen2.5-1.5B-instruct"
+gen_device = 1          # physical GPU that vLLM should use
 beta = 0.04
 all_steps = 1000
 Q_batch_size = 5
@@ -90,7 +92,7 @@ def GRPO_step(batch):
     return loss
 
 
-def gen_worker(Q, physics_device):
+def gen_worker(Q, physics_device, run_id=None):
     os.environ["CUDA_VISIBLE_DEVICES"] = f'{physics_device}'
     torch.cuda.set_device(0)
     print(f"Generation worker process uses GPU {physics_device}")
@@ -98,7 +100,7 @@ def gen_worker(Q, physics_device):
     vllm_gen = LLM(model=model_path, gpu_memory_utilization=0.5)
     ref_server_ver = 'tensor'  # don't worry, it will auto switch based on the first upload
 
-    sampling_params = SamplingParams(n=num_pre_Q, temperature=0.9, max_tokens=700)
+    sampling_params = SamplingParams(n=num_pre_Q, temperature=0.9, max_tokens=4000)
     gen_logps_sp = SamplingParams(temperature=0, top_p=1, max_tokens=1, prompt_logprobs=1)
 
     from datasets import load_dataset
@@ -136,18 +138,25 @@ def gen_worker(Q, physics_device):
         answer_count = answer.count("<answer>") + answer.count("</answer>")
         return 1.25 if re.match(pattern, answer, re.DOTALL | re.VERBOSE) and think_count==2 and answer_count==2 else -1
 
+    gen_table_columns = ["prompt", "generation", "reward", "advantage", "reward_correct", "reward_format"]
 
     def gen_samples(inputs):
         prompts = [x["Q"] for x in inputs]
         answers, ans_token_ids = gen_answers(prompts)
-        rewards = []
+        rewards_correct, rewards_format = [], []
         for i, inp in enumerate(inputs):
             for a in answers[i*num_pre_Q:(i+1)*num_pre_Q]:
-                rewards.append(reward_correct(inp, a) + reward_format(inp, a))
+                rewards_correct.append(reward_correct(inp, a))
+                rewards_format.append(reward_format(inp, a))
+
+        rewards_correct = torch.tensor(rewards_correct, dtype=torch.float32)
+        rewards_format = torch.tensor(rewards_format, dtype=torch.float32)
+        rewards = rewards_correct + rewards_format
+
         prompts_text = [tokenizer.apply_chat_template([
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": x}], tokenize=False, add_generation_prompt=True) for x in prompts]
-        return prompts_text, torch.tensor(rewards, dtype=torch.float32), answers, ans_token_ids
+        return prompts_text, rewards, answers, ans_token_ids, rewards_correct, rewards_format
 
     def try_update_model():
         try:
@@ -166,9 +175,68 @@ def gen_worker(Q, physics_device):
         if it % 3 == 0: try_update_model()
         inputs = random.sample(QAs, Q_batch_size)
         tic = time.time()
-        prompt_inputs, rewards, answers, ans_token_ids = gen_samples(inputs)
-        print(f'time: {time.time()-tic:.2f}s    ', 'rewards:', rewards, )
+        prompt_inputs, rewards, answers, ans_token_ids, rewards_correct, rewards_format = gen_samples(inputs)
+        gen_time = time.time()-tic
+        print(f'time: {gen_time:.2f}s    ', 'rewards:', rewards, )
+
+        if run_id:
+            try:
+                completion_lengths = torch.tensor([len(x) for x in ans_token_ids], dtype=torch.float32)
+                rewards_grouped = rewards.view(-1, num_pre_Q)
+                std_grouped_rewards = rewards_grouped.std(dim=1)
+                is_std_zero = torch.isclose(std_grouped_rewards, torch.zeros_like(std_grouped_rewards))
+                frac_reward_zero_std = is_std_zero.float().mean().item()
+                
+                log_dict = {
+                    "gen/time": gen_time,
+                    "gen/rewards_mean": rewards.mean().item(),
+                    "gen/rewards_std": rewards.std().item(),
+                    "gen/rewards_min": rewards.min().item(),
+                    "gen/rewards_max": rewards.max().item(),
+                    "gen/rewards_correct_mean": rewards_correct.mean().item(),
+                    "gen/rewards_correct_std": rewards_correct.std().item(),
+                    "gen/rewards_format_mean": rewards_format.mean().item(),
+                    "gen/rewards_format_std": rewards_format.std().item(),
+                    "gen/completion/mean_length": completion_lengths.mean().item(),
+                    "gen/completion/min_length": completion_lengths.min().item(),
+                    "gen/completion/max_length": completion_lengths.max().item(),
+                    "gen/reward_std_per_group": std_grouped_rewards.mean().item(),
+                    "gen/frac_reward_zero_std": frac_reward_zero_std,
+                }
+                wandb.log(log_dict)
+            except Exception as e:
+                print(f"[gen_worker] wandb.log failed: {e}", file=sys.stderr)
+                raise  # Re-raise the exception
+
         if it % 5 == 0: print('answers:', answers[0])
+
+        if run_id and it % 20 == 0:
+            try:
+                table = wandb.Table(columns=gen_table_columns)
+                # Reshape rewards and calculate advantages for table logging
+                rewards_grouped = rewards.view(Q_batch_size, num_pre_Q)
+                rewards_correct_grouped = rewards_correct.view(Q_batch_size, num_pre_Q)
+                rewards_format_grouped = rewards_format.view(Q_batch_size, num_pre_Q)
+                
+                mean_grouped_rewards = rewards_grouped.mean(dim=1, keepdim=True)
+                std_grouped_rewards = rewards_grouped.std(dim=1, keepdim=True)
+                advantages = (rewards_grouped - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+
+                for i in range(len(inputs)):
+                    prompt = inputs[i]['Q']
+                    for j in range(num_pre_Q):
+                        table.add_data(
+                            prompt, 
+                            answers[i * num_pre_Q + j], 
+                            rewards_grouped[i, j].item(),
+                            advantages[i, j].item(),
+                            rewards_correct_grouped[i, j].item(),
+                            rewards_format_grouped[i, j].item()
+                        )
+                wandb.log({"generations": table})
+            except Exception as e:
+                print(f"[gen_worker] wandb.log(table) failed: {e}", file=sys.stderr)
+                raise  # Re-raise the exception
 
         for i, pp in enumerate(prompt_inputs):
             prompt_ids = tokenizer(pp, return_tensors="pt", add_special_tokens=False)["input_ids"]
