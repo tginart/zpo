@@ -269,7 +269,7 @@ def actor_process(actor_gpu: int, req_q: mp.Queue, resp_q: mp.Queue, max_gen_tok
             break
         elif mtype == "UPDATE_WEIGHTS":
             model_gen.load_state_dict(msg["state_dict"]); resp_q.put({"status": "OK"})
-            if False:
+            if True:
                 bad = []
                 for n, p in model_gen.named_parameters():
                     if not torch.isfinite(p).all():
@@ -280,7 +280,7 @@ def actor_process(actor_gpu: int, req_q: mp.Queue, resp_q: mp.Queue, max_gen_tok
                     # print stats of one parameter
                     n, p = next(iter(model_gen.named_parameters()))
                     print(f"[Actor] Param stats {n}: {_tensor_stats(p)}")
-                if False:
+                if True:
                     print(f"[Actor] Model param stats after load:")
                     for n, p in model_gen.named_parameters():
                         print(f"    {n}: min={p.min().item():.4e}, max={p.max().item():.4e}, mean={p.mean().item():.4e}, std={p.std().item():.4e}")
@@ -293,9 +293,14 @@ def actor_process(actor_gpu: int, req_q: mp.Queue, resp_q: mp.Queue, max_gen_tok
             # Prepare input for generation
             inputs = torch.tensor([prefix_ids], device=actor_device)
             prompt_len = len(prefix_ids)
+            # print shape of inputs
+            print(f"[ACTOR DEBUG] inputs shape: {inputs.shape}")
+            # Build attention mask for the input (all 1s for prompt)
+            attention_mask = torch.ones_like(inputs)
             # Generate rollouts
             outputs = model_gen.generate(
                 inputs,
+                attention_mask=attention_mask,
                 do_sample=True,
                 temperature=1.0,
                 top_p=0.9,
@@ -306,19 +311,37 @@ def actor_process(actor_gpu: int, req_q: mp.Queue, resp_q: mp.Queue, max_gen_tok
                 return_dict_in_generate=True,
             )
             full_sequences_ids = outputs.sequences
+            print(f"[ACTOR DEBUG] full_sequences_ids shape: {full_sequences_ids.shape}")
             ans_token_ids = full_sequences_ids[:, prompt_len:]
             answers = tokenizer.batch_decode(ans_token_ids, skip_special_tokens=True)
             rewards = reward_fn(answers, items=[reward_context] * len(answers))
             # Log-probs and entropies for generated tokens
             gen_logits_gen_model = torch.stack(outputs.scores, dim=1)
+            print(f"[ACTOR DEBUG] gen_logits_gen_model shape: {gen_logits_gen_model.shape}")
+            print(f"[ACTOR DEBUG] gen_logits_gen_model min/max: {gen_logits_gen_model.min().item()}, {gen_logits_gen_model.max().item()}")
             gen_log_softmax = torch.log_softmax(gen_logits_gen_model, dim=-1)
+            print(f"[ACTOR DEBUG] gen_log_softmax shape: {gen_log_softmax.shape}")
+            print(f"[ACTOR DEBUG] gen_log_softmax min/max: {gen_log_softmax.min().item()}, {gen_log_softmax.max().item()}")
             gen_logps = torch.gather(gen_log_softmax, -1, ans_token_ids.unsqueeze(-1)).squeeze(-1)
+            print(f"[ACTOR DEBUG] gen_logps shape: {gen_logps.shape}")
+            print(f"[ACTOR DEBUG] gen_logps min/max: {gen_logps.min().item()}, {gen_logps.max().item()}")
+
+            # === NEW DEBUG PRINTS FOR TOKEN ALIGNMENT ===
+            print("[ACTOR DEBUG] gen_logps min/max:", gen_logps.min().item(), gen_logps.max().item())
+            print("[ACTOR DEBUG] Any -inf in gen_logps?", torch.isinf(gen_logps).any().item())
+            print("[ACTOR DEBUG] ans_token_ids min/max:", ans_token_ids.min().item(), ans_token_ids.max().item())
+            print("[ACTOR DEBUG] gen_log_softmax shape:", gen_log_softmax.shape)
+            print("[ACTOR DEBUG] ans_token_ids shape:", ans_token_ids.shape)
+            # === END NEW DEBUG PRINTS ===
+
             softmax = torch.softmax(gen_logits_gen_model, dim=-1)
             log_softmax = torch.log_softmax(gen_logits_gen_model, dim=-1)
             entropies = -(softmax * log_softmax).sum(dim=-1)
             # Reference model logps
+            # Build attention mask for the full sequence (1 for all tokens, including generated)
+            ref_attention_mask = (full_sequences_ids != tokenizer.pad_token_id).long()
             with torch.no_grad():
-                ref_logits = model_ref(full_sequences_ids).logits[:, prompt_len - 1 : -1, :]
+                ref_logits = model_ref(full_sequences_ids, attention_mask=ref_attention_mask).logits[:, prompt_len - 1 : -1, :]
             ref_log_softmax = torch.log_softmax(ref_logits, dim=-1)
             ref_logps = torch.gather(ref_log_softmax, -1, ans_token_ids.unsqueeze(-1)).squeeze(-1)
             resp_q.put({
@@ -491,8 +514,8 @@ def main():
                 max_seq_len = max(len(s) for s in sequences)
                 max_gen_len = max(len(l) for l in gen_logps)
                 for s in sequences: s.extend([tokenizer.pad_token_id] * (max_seq_len - len(s)))
-                for l in gen_logps: l.extend([0.0] * (max_gen_len - len(l)))
-                for l in ref_logps: l.extend([0.0] * (max_gen_len - len(l)))
+                for l in gen_logps: l.extend([-100.0] * (max_gen_len - len(l)))
+                for l in ref_logps: l.extend([-100.0] * (max_gen_len - len(l)))
                 batch_raw = {
                     "sequences": sequences, "rewards": rewards, "gen_logps": gen_logps,
                     "ref_logps": ref_logps, "prompt_lens": prompt_lens,
@@ -529,10 +552,16 @@ def main():
                     ref_logps[mb_start:mb_end],
                     advantages[mb_start:mb_end],
                     ans_token_ids[mb_start:mb_end],
+                    prompt_lens[mb_start:mb_end],
                 ))
         # Now process the next micro-batch
         mb_idx = step % num_micro_batches
-        mb_sequences, mb_rewards, mb_gen_old, mb_ref_logps, mb_advantages, mb_ans_token_ids = mb_data[mb_idx]
+        mb_sequences, mb_rewards, mb_gen_old, mb_ref_logps, mb_advantages, mb_ans_token_ids, mb_prompt_lens = mb_data[mb_idx]
+        print(f"[DEBUG] mb_sequences shape: {mb_sequences.shape}")
+        if mb_sequences.shape[0] == 0:
+            print("[WARNING] Skipping empty micro-batch")
+            step += 1
+            continue
         # Forward pass
         logits = engine(mb_sequences).logits
         full_logps = per_token_logps(logits[:, :-1, :], mb_sequences[:, 1:])
@@ -540,24 +569,53 @@ def main():
         gen_len = mb_gen_old.shape[1]
         curr_logps_list = []
         for i in range(full_logps.shape[0]):
-            p_len = prompt_lens[i]
+            p_len = mb_prompt_lens[i]
             ans_len = len(mb_ans_token_ids[i])
             sliced = full_logps[i, p_len - 1 : p_len - 1 + ans_len]
-            padded = F.pad(sliced, (0, gen_len - ans_len), value=0.0)
+            padded = F.pad(sliced, (0, gen_len - ans_len), value=-100.0)
             curr_logps_list.append(padded)
         curr_logps = torch.stack(curr_logps_list, dim=0)
-        # PPO-style loss (same as GRPO)
-        ratios = torch.exp(curr_logps - mb_gen_old.detach())
-        clipped = torch.clamp(ratios, 1 - clip_param, 1 + clip_param)
-        pg_loss = -torch.min(ratios * mb_advantages.unsqueeze(-1), clipped * mb_advantages.unsqueeze(-1))
-        kl = torch.exp(mb_ref_logps - curr_logps) - (mb_ref_logps - curr_logps) - 1
-        per_tok_loss = pg_loss + beta * kl
-        # Mask (based on ans_token_ids) to ignore padding
+
+        # === DEBUG PRINTS START ===
+        def print_stats(name, t):
+            print(f"[DEBUG] {name}: shape={t.shape}, min={t.min().item():.4f}, max={t.max().item():.4f}, mean={t.mean().item():.4f}, std={t.std().item():.4f}, has_nan={torch.isnan(t).any().item()}, has_inf={torch.isinf(t).any().item()}")
+
+        print_stats("curr_logps", curr_logps)
+        print_stats("mb_gen_old", mb_gen_old)
+        print_stats("mb_ref_logps", mb_ref_logps)
+        print_stats("mb_advantages", mb_advantages)
+        print(f"[DEBUG] mb_prompt_lens: {mb_prompt_lens}")
+        print(f"[DEBUG] mb_ans_token_ids (lens): {[len(x) for x in mb_ans_token_ids]}")
+        print(f"[DEBUG] mb_ans_token_ids (sample): {mb_ans_token_ids[0] if len(mb_ans_token_ids) > 0 else 'N/A'}")
+        # === DEBUG PRINTS END ===
+
+        # Create mask (based on ans_token_ids) to ignore padding BEFORE computing exponentials
         max_ans_len = max(len(x) for x in mb_ans_token_ids)
         mask = torch.zeros(len(mb_ans_token_ids), max_ans_len, device=engine.device, dtype=torch.float32)
         for i, toks in enumerate(mb_ans_token_ids):
             mask[i, : len(toks)] = 1.0
+
+        # Clamp differences to prevent overflow in exp()
+        ratio_diff = torch.clamp(curr_logps - mb_gen_old.detach(), min=-20.0, max=20.0)
+        kl_diff = torch.clamp(mb_ref_logps - curr_logps, min=-20.0, max=20.0)
+
+        # PPO-style loss (same as GRPO) with clamped differences
+        ratios = torch.exp(ratio_diff)
+        clipped = torch.clamp(ratios, 1 - clip_param, 1 + clip_param)
+        pg_loss = -torch.min(ratios * mb_advantages.unsqueeze(-1), clipped * mb_advantages.unsqueeze(-1))
+        kl = torch.exp(kl_diff) - kl_diff - 1
+        per_tok_loss = pg_loss + beta * kl
+
+        # More debug prints
+        print_stats("ratios", ratios)
+        print_stats("clipped", clipped)
+        print_stats("pg_loss", pg_loss)
+        print_stats("kl", kl)
+        print_stats("per_tok_loss", per_tok_loss)
+        print_stats("mask", mask)
+
         loss = ((per_tok_loss * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)).mean()
+        print(f"[DEBUG] loss: {loss.item()}, isfinite={torch.isfinite(loss).item()}")
         # Backprop / optimizer step (accumulate gradients)
         if not torch.isfinite(loss):
             if rank == 0:
