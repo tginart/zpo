@@ -253,15 +253,23 @@ def actor_process(actor_gpu: int, req_q: mp.Queue, resp_q: mp.Queue, max_gen_tok
     # Ensure this process only sees the actor GPU
     # All 8 GPUs are now visible to this process (0-7)
     # The actor will use GPU 7 directly
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(actor_gpu)
+    print(f"Visible devices: {os.environ['CUDA_VISIBLE_DEVICES']}")
     import torch  # re-import under the new CUDA context
 
+    print(f"Effective device: {torch.cuda.current_device()}")
+    print(f"Device name: {torch.cuda.get_device_name()}")
+    print(f"Visible devices: {os.environ['CUDA_VISIBLE_DEVICES']}")
+
+
+    # print visible devices as a check
+    print(f"[ACTOR DEBUG] Visible devices: {torch.cuda.device_count()}")
+
     # Use GPU 7 for the actor
-    actor_device = torch.device("cuda:7")
+    actor_device = torch.device("cuda:0")
 
     # Print some debugging information
     print(f"[ACTOR DEBUG] Using GPU 7 for actor")
-    print(f"[ACTOR DEBUG] Visible devices: {torch.cuda.device_count()}")
-    print(f"[ACTOR DEBUG] Device name (cuda:7): {torch.cuda.get_device_name(7)}")
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     if tokenizer.pad_token_id is None:
@@ -426,31 +434,79 @@ def split_segments(root_seg, item, req_q, resp_q):
     Perform exploitation-only splitting for a fixed number of rounds.
     Returns all rollouts collected during splitting.
     """
+    print_detailed_logs = True
+
     all_rollouts = []
-    # TODO eventually 4 will be hyperparam rather than hardcoded
+
     for round_idx in range(4):
+        if print_detailed_logs:
+            print(f"\n[split_segments] === Round {round_idx+1} ===")
         all_segments = get_all_segments(root_seg)
+        if print_detailed_logs:
+            print(f"[split_segments] Total segments in tree: {len(all_segments)}")
         leaves = [s for s in all_segments if s.is_leaf and s.length >= 2 * MIN_LEN]
+        if print_detailed_logs:
+            print(f"[split_segments] Leaves eligible for split (len >= 2*MIN_LEN): {len(leaves)}")
+            for i, s in enumerate(leaves):
+                print(f"    Leaf {i}: len={s.length}, rollout_count={s.rollout_count}, mean={getattr(s, 'mean', None):.4f}")
         rewards = [s.mean for s in leaves if s.rollout_count > 0]
         global_mean = sum(rewards) / len(rewards) if rewards else 0.0
         global_std = torch.tensor(rewards).std().item() if len(rewards) > 1 else 1.0
+        if print_detailed_logs:
+            print(f"[split_segments] Global mean: {global_mean:.4f}, std: {global_std:.4f}")
         for s in leaves:
             if s.rollout_count > 0:
                 s.advantage = (s.mean - global_mean) / (global_std + 1e-8)
+            else:
+                s.advantage = float('-inf')
+        if print_detailed_logs:
+            print("[split_segments] Leaf advantages:")
+            for i, s in enumerate(leaves):
+                print(f"    Leaf {i}: advantage={getattr(s, 'advantage', None):.4f}")
         candidates = [s for s in leaves if s.advantage >= THETA_A]
+        if print_detailed_logs:
+            print(f"[split_segments] Candidates with advantage >= {THETA_A}: {len(candidates)}")
+            for i, s in enumerate(candidates):
+                print(f"    Candidate {i}: len={s.length}, advantage={s.advantage:.4f}")
+
+        # --- PATCH: fallback to root if no candidates ---
         if not candidates:
-            break
-        seg_to_split = max(candidates, key=lambda s: s.advantage)
+            if print_detailed_logs:
+                print("[split_segments] No candidates found. Checking if root can be used as fallback.")
+            # Only allow root if it hasn't been split yet
+            if root_seg.is_leaf:
+                candidates = [root_seg]
+                if print_detailed_logs:
+                    print("[split_segments] Using root segment as fallback candidate.")
+            else:
+                if print_detailed_logs:
+                    print("[split_segments] No fallback possible. Stopping splitting rounds.")
+                break
+        # -----------------------------------------------
+
+        seg_to_split = max(candidates, key=lambda s: getattr(s, "advantage", 0.0))
+        if print_detailed_logs:
+            print(f"[split_segments] Selected segment to split: len={seg_to_split.length}, advantage={getattr(seg_to_split, 'advantage', None):.4f}")
         split_idx = find_entropy_split(seg_to_split, MIN_LEN)
+        if print_detailed_logs:
+            print(f"[split_segments] Split index found: {split_idx}")
         if split_idx is None:
+            if print_detailed_logs:
+                print("[split_segments] No valid split index found. Stopping splitting rounds.")
             break
         child = seg_to_split.split(split_idx)
+        if print_detailed_logs:
+            print(f"[split_segments] Performed split at idx={split_idx}. New child segment len={child.length}")
         # Generate rollouts from the new segment
         rollouts = generate_rollouts(req_q, resp_q, child, 4, item)
-        for rollout in rollouts:
+        if print_detailed_logs:
+            print(f"[split_segments] Generated {len(rollouts)} rollouts from new child segment.")
+        for rollout_idx, rollout in enumerate(rollouts):
             new_segment = Segment(rollout["actions"], parent=child)
             child.children.append(new_segment)
             new_segment.propagate_reward(rollout["reward"])
+            if print_detailed_logs:
+                print(f"[split_segments]   Rollout {rollout_idx}: reward={rollout['reward']:.4f}, seq_len={len(rollout['full_seq'])}")
             all_rollouts.append({
                 "prefix_len": rollout["prefix_len"],
                 "sequence": rollout["full_seq"],
@@ -461,6 +517,8 @@ def split_segments(root_seg, item, req_q, resp_q):
                 "answer": rollout["answer"],
                 "prompt": rollout["prompt"],
             })
+    if print_detailed_logs:
+        print(f"[split_segments] Total rollouts collected: {len(all_rollouts)}")
     return all_rollouts
 
 

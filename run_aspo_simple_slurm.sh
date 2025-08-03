@@ -78,7 +78,7 @@ echo "#################################################################"
 # The `deepspeed` command will launch `NUM_TRAIN_GPUS` processes.
 # We pass all 8 GPUs to DeepSpeed but only use 7 for training.
 # The python script (rank 0) will then launch the actor process on GPU 7.
-deepspeed --include localhost:0,1,2,3,4,5,6,7 \
+deepspeed --num_gpus 7 \
     ${PYTHON_SCRIPT} \
     --actor_gpu ${ACTOR_GPU_ID} \
     --train_gpus ${NUM_TRAIN_GPUS} \
