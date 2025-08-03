@@ -135,15 +135,26 @@ def find_entropy_split(segment: Segment, min_len: int) -> Optional[int]:
     The split must respect the `min_len` constraint for both the resulting
     parent and child segments.
     """
+    print(f"[find_entropy_split] Called with segment of length {segment.length}, min_len={min_len}")
     if segment.length < 2 * min_len:
+        print(f"[find_entropy_split] Segment too short to split: {segment.length} < 2*{min_len}={2*min_len}")
         return None
     max_entropy = -1.0
     split_idx = -1
+    entropies = []
     for i in range(min_len, segment.length - min_len + 1):
         entropy = segment.actions[i - 1].entropy
+        entropies.append((i, entropy))
+        print(f"[find_entropy_split] Checking split at {i}: entropy={entropy:.4f}")
         if entropy > max_entropy:
+            print(f"[find_entropy_split] New max entropy found: {entropy:.4f} at split {i}")
             max_entropy = entropy
             split_idx = i
+    if split_idx != -1:
+        print(f"[find_entropy_split] Best split index: {split_idx} with max entropy {max_entropy:.4f}")
+    else:
+        print(f"[find_entropy_split] No valid split found.")
+    print(f"[find_entropy_split] All candidate entropies: {[(i, f'{e:.4f}') for i, e in entropies]}")
     return split_idx if split_idx != -1 else None
 
 # -------------------------------------------------------------------------------------------------
@@ -189,7 +200,7 @@ num_train_devices: int = args.train_gpus  # expected 7
 
 # Exploitation-only ASPO segment split parameters
 MIN_LEN = 16  # Minimum segment length for splitting (must have at least 2*MIN_LEN tokens)
-THETA_A = -0.1  # Always split if possible (greedy exploitation)
+THETA_A = -9999999999  # Always split if possible (greedy exploitation)
 
 grad_accum: int = args.gradient_accumulation_steps
 
@@ -197,7 +208,8 @@ grad_accum: int = args.gradient_accumulation_steps
 TRAIN_MICRO_BATCH_SIZE = 1
 assert num_rollouts % (TRAIN_MICRO_BATCH_SIZE * num_train_devices) == 0, "num_rollouts must be a multiple of (TRAIN_MICRO_BATCH_SIZE * num_train_devices)"
 # make sure gradient accumulation is a multiple of  num_rollouts / (TRAIN_MICRO_BATCH_SIZE * num_train_devices)
-assert grad_accum % (num_rollouts / (TRAIN_MICRO_BATCH_SIZE * num_train_devices)) == 0, "gradient accumulation must be a multiple of num_rollouts / (TRAIN_MICRO_BATCH_SIZE * num_train_devices)"
+logical_micro_batches = num_rollouts // (TRAIN_MICRO_BATCH_SIZE * num_train_devices)
+assert grad_accum % logical_micro_batches == 0, "gradient accumulation must be a multiple of num_rollouts / (TRAIN_MICRO_BATCH_SIZE * num_train_devices)"
 
 # DeepSpeed runtime config
 DS_CONFIG: Dict[str, Any] = {
@@ -269,7 +281,7 @@ def actor_process(actor_gpu: int, req_q: mp.Queue, resp_q: mp.Queue, max_gen_tok
             break
         elif mtype == "UPDATE_WEIGHTS":
             model_gen.load_state_dict(msg["state_dict"]); resp_q.put({"status": "OK"})
-            if True:
+            if False:
                 bad = []
                 for n, p in model_gen.named_parameters():
                     if not torch.isfinite(p).all():
@@ -280,7 +292,7 @@ def actor_process(actor_gpu: int, req_q: mp.Queue, resp_q: mp.Queue, max_gen_tok
                     # print stats of one parameter
                     n, p = next(iter(model_gen.named_parameters()))
                     print(f"[Actor] Param stats {n}: {_tensor_stats(p)}")
-                if True:
+                if False:
                     print(f"[Actor] Model param stats after load:")
                     for n, p in model_gen.named_parameters():
                         print(f"    {n}: min={p.min().item():.4e}, max={p.max().item():.4e}, mean={p.mean().item():.4e}, std={p.std().item():.4e}")
@@ -317,8 +329,10 @@ def actor_process(actor_gpu: int, req_q: mp.Queue, resp_q: mp.Queue, max_gen_tok
             rewards = reward_fn(answers, items=[reward_context] * len(answers))
             # Log-probs and entropies for generated tokens
             gen_logits_gen_model = torch.stack(outputs.scores, dim=1)
-            print(f"[ACTOR DEBUG] gen_logits_gen_model shape: {gen_logits_gen_model.shape}")
-            print(f"[ACTOR DEBUG] gen_logits_gen_model min/max: {gen_logits_gen_model.min().item()}, {gen_logits_gen_model.max().item()}")
+            # print(f"[ACTOR DEBUG] gen_logits_gen_model shape: {gen_logits_gen_model.shape}")
+            # print(f"[ACTOR DEBUG] gen_logits_gen_model min/max: {gen_logits_gen_model.min().item()}, {gen_logits_gen_model.max().item()}")
+            # print(f"[ACTOR DEBUG] gen_logits_gen_model has_nan: {torch.isnan(gen_logits_gen_model).any().item()}")
+            # print(f"[ACTOR DEBUG] gen_logits_gen_model has_inf: {torch.isinf(gen_logits_gen_model).any().item()}")
             gen_log_softmax = torch.log_softmax(gen_logits_gen_model, dim=-1)
             print(f"[ACTOR DEBUG] gen_log_softmax shape: {gen_log_softmax.shape}")
             print(f"[ACTOR DEBUG] gen_log_softmax min/max: {gen_log_softmax.min().item()}, {gen_log_softmax.max().item()}")
@@ -327,16 +341,18 @@ def actor_process(actor_gpu: int, req_q: mp.Queue, resp_q: mp.Queue, max_gen_tok
             print(f"[ACTOR DEBUG] gen_logps min/max: {gen_logps.min().item()}, {gen_logps.max().item()}")
 
             # === NEW DEBUG PRINTS FOR TOKEN ALIGNMENT ===
-            print("[ACTOR DEBUG] gen_logps min/max:", gen_logps.min().item(), gen_logps.max().item())
-            print("[ACTOR DEBUG] Any -inf in gen_logps?", torch.isinf(gen_logps).any().item())
-            print("[ACTOR DEBUG] ans_token_ids min/max:", ans_token_ids.min().item(), ans_token_ids.max().item())
-            print("[ACTOR DEBUG] gen_log_softmax shape:", gen_log_softmax.shape)
-            print("[ACTOR DEBUG] ans_token_ids shape:", ans_token_ids.shape)
+            # print("[ACTOR DEBUG] gen_logps min/max:", gen_logps.min().item(), gen_logps.max().item())
+            # print("[ACTOR DEBUG] Any -inf in gen_logps?", torch.isinf(gen_logps).any().item())
+            # print("[ACTOR DEBUG] ans_token_ids min/max:", ans_token_ids.min().item(), ans_token_ids.max().item())
+            # print("[ACTOR DEBUG] gen_log_softmax shape:", gen_log_softmax.shape)
+            # print("[ACTOR DEBUG] ans_token_ids shape:", ans_token_ids.shape)
             # === END NEW DEBUG PRINTS ===
 
-            softmax = torch.softmax(gen_logits_gen_model, dim=-1)
-            log_softmax = torch.log_softmax(gen_logits_gen_model, dim=-1)
-            entropies = -(softmax * log_softmax).sum(dim=-1)
+            entropies = torch.distributions.Categorical(logits=gen_logits_gen_model).entropy()
+            print(f"[ACTOR DEBUG] entropies shape: {entropies.shape}")
+            print(f"[ACTOR DEBUG] entropies min/max: {entropies.min().item()}, {entropies.max().item()}")
+            print(f"[ACTOR DEBUG] entropies has_nan: {torch.isnan(entropies).any().item()}")
+            print(f"[ACTOR DEBUG] entropies has_inf: {torch.isinf(entropies).any().item()}")
             # Reference model logps
             # Build attention mask for the full sequence (1 for all tokens, including generated)
             ref_attention_mask = (full_sequences_ids != tokenizer.pad_token_id).long()
@@ -356,6 +372,237 @@ def actor_process(actor_gpu: int, req_q: mp.Queue, resp_q: mp.Queue, max_gen_tok
             })
         else:
             raise RuntimeError(f"Unknown msg type {mtype}")
+
+def generate_rollouts(req_q, resp_q, segment, num_rollouts, item):
+    """
+    Request the actor to generate rollouts from a given segment prefix.
+    Returns a list of dicts with (full_seq, actions, reward, etc.) for each rollout.
+    """
+    req_q.put({
+        "type": "GENERATE",
+        "prefix_ids": segment.prefix_ids,
+        "num_rollouts": num_rollouts,
+        "item": item,
+    })
+    res = resp_q.get()
+    rollouts = []
+    for j in range(len(res["full_sequences"])):
+        full_seq = res["full_sequences"][j]
+        prefix_len = len(segment.prefix_ids)
+        gen_part = full_seq[prefix_len:]
+        actions = [
+            Action(
+                gen_part[k],
+                res["entropies"][j][k],
+                res["gen_logps"][j][k],
+                res["ref_logps"][j][k]
+            )
+            for k in range(len(gen_part))
+        ]
+        rollouts.append({
+            "full_seq": full_seq,
+            "actions": actions,
+            "reward": res["rewards"][j],
+            "gen_logps": res["gen_logps"][j],
+            "ref_logps": res["ref_logps"][j],
+            "ans_token_ids": gen_part,
+            "prefix_len": prefix_len,
+        })
+    return rollouts
+
+
+def split_segments(root_seg, item, req_q, resp_q):
+    """
+    Perform exploitation-only splitting for a fixed number of rounds.
+    Returns all rollouts collected during splitting.
+    """
+    all_rollouts = []
+    for round_idx in range(4):
+        all_segments = get_all_segments(root_seg)
+        leaves = [s for s in all_segments if s.is_leaf and s.length >= 2 * MIN_LEN]
+        rewards = [s.mean for s in leaves if s.rollout_count > 0]
+        global_mean = sum(rewards) / len(rewards) if rewards else 0.0
+        global_std = torch.tensor(rewards).std().item() if len(rewards) > 1 else 1.0
+        for s in leaves:
+            if s.rollout_count > 0:
+                s.advantage = (s.mean - global_mean) / (global_std + 1e-8)
+        candidates = [s for s in leaves if s.advantage >= THETA_A]
+        if not candidates:
+            break
+        seg_to_split = max(candidates, key=lambda s: s.advantage)
+        split_idx = find_entropy_split(seg_to_split, MIN_LEN)
+        if split_idx is None:
+            break
+        child = seg_to_split.split(split_idx)
+        # Generate rollouts from the new segment
+        rollouts = generate_rollouts(req_q, resp_q, child, 4, item)
+        for rollout in rollouts:
+            new_segment = Segment(rollout["actions"], parent=child)
+            child.children.append(new_segment)
+            new_segment.propagate_reward(rollout["reward"])
+            all_rollouts.append({
+                "prefix_len": rollout["prefix_len"],
+                "sequence": rollout["full_seq"],
+                "reward": rollout["reward"],
+                "gen_logps": rollout["gen_logps"],
+                "ref_logps": rollout["ref_logps"],
+                "ans_token_ids": rollout["ans_token_ids"],
+            })
+    return all_rollouts
+
+
+def construct_training_batch(all_rollouts, tokenizer):
+    """
+    Pads and packages the rollouts into a batch dictionary for training.
+    """
+    sequences, rewards, gen_logps, ref_logps, prompt_lens, ans_token_ids = [], [], [], [], [], []
+    for traj in all_rollouts:
+        sequences.append(traj["sequence"])
+        rewards.append(traj["reward"])
+        prompt_lens.append(traj["prefix_len"])
+        ans_token_ids.append(traj["ans_token_ids"])
+        gen_logps.append(traj["gen_logps"])
+        ref_logps.append(traj["ref_logps"])
+    max_seq_len = max(len(s) for s in sequences)
+    max_gen_len = max(len(l) for l in gen_logps)
+    for s in sequences: s.extend([tokenizer.pad_token_id] * (max_seq_len - len(s)))
+    for l in gen_logps: l.extend([-100.0] * (max_gen_len - len(l)))
+    for l in ref_logps: l.extend([-100.0] * (max_gen_len - len(l)))
+    return {
+        "sequences": sequences, "rewards": rewards, "gen_logps": gen_logps,
+        "ref_logps": ref_logps, "prompt_lens": prompt_lens,
+        "ans_token_ids": ans_token_ids,
+    }
+
+def collect_training_batch(req_q, resp_q, tokenizer, task_items):
+    """
+    Orchestrates the full batch collection process for one training step.
+    - Samples a prompt
+    - Generates initial rollouts
+    - Performs exploitation-only splits
+    - Packages everything into a training batch
+    """
+    # Sample a prompt and build the root segment
+    item = random.choice(task_items)
+    system_prompt = "You are a helpful assistant."
+    user_prompt = item["prompt"][0]["content"] if isinstance(item["prompt"], list) else item["prompt"]
+    tip_text = tokenizer.apply_chat_template(
+        [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+        tokenize=False, add_generation_prompt=True,
+    )
+    prompt_tokens = tokenizer.encode(tip_text)
+    root_seg = Segment([Action(tok, 0.0, 0.0, 0.0) for tok in prompt_tokens])
+
+    # Initial rollouts from root
+    initial_rollouts = generate_rollouts(req_q, resp_q, root_seg, 5, item)
+    for rollout in initial_rollouts:
+        new_segment = Segment(rollout["actions"], parent=root_seg)
+        root_seg.children.append(new_segment)
+        new_segment.propagate_reward(rollout["reward"])
+    all_rollouts = [
+        {
+            "prefix_len": rollout["prefix_len"],
+            "sequence": rollout["full_seq"],
+            "reward": rollout["reward"],
+            "gen_logps": rollout["gen_logps"],
+            "ref_logps": rollout["ref_logps"],
+            "ans_token_ids": rollout["ans_token_ids"],
+        }
+        for rollout in initial_rollouts
+    ]
+
+    # Exploitation-only splitting
+    all_rollouts += split_segments(root_seg, item, req_q, resp_q)
+
+    # temporary but for let's assert we get expected number of rollouts
+    assert len(all_rollouts) == 5 + 4 * 4, f"Expected 21 rollouts, got {len(all_rollouts)}"
+
+    # Batch construction
+    batch_raw = construct_training_batch(all_rollouts, tokenizer)
+    return batch_raw
+
+def pack_micro_batches(batch_raw, engine, num_micro_batches, micro_batch_size):
+    """
+    Splits the full batch into micro-batches for gradient accumulation.
+    Returns a list of tuples, each containing the tensors and lists for a micro-batch.
+    """
+    sequences = torch.tensor(batch_raw["sequences"], dtype=torch.long, device=engine.device)
+    rewards = torch.tensor(batch_raw["rewards"], dtype=torch.bfloat16, device=engine.device)
+    gen_old = torch.tensor(batch_raw["gen_logps"], dtype=torch.bfloat16, device=engine.device)
+    ref_logps = torch.tensor(batch_raw["ref_logps"], dtype=torch.bfloat16, device=engine.device)
+    prompt_lens = batch_raw["prompt_lens"]
+    ans_token_ids = batch_raw["ans_token_ids"]
+    # Compute advantages over the full batch
+    adv_mean, adv_std = rewards.mean(), rewards.std()
+    advantages = (rewards - adv_mean) / (adv_std + 1e-4)
+    mb_data = []
+    for mb_idx in range(num_micro_batches):
+        mb_start = mb_idx * micro_batch_size
+        mb_end = (mb_idx + 1) * micro_batch_size
+        mb_data.append((
+            sequences[mb_start:mb_end],
+            rewards[mb_start:mb_end],
+            gen_old[mb_start:mb_end],
+            ref_logps[mb_start:mb_end],
+            advantages[mb_start:mb_end],
+            ans_token_ids[mb_start:mb_end],
+            prompt_lens[mb_start:mb_end],
+        ))
+    return mb_data, rewards, adv_mean, adv_std
+
+
+def compute_loss_and_step(engine, F, mb_sequences, mb_rewards, mb_gen_old, mb_ref_logps, mb_advantages, mb_ans_token_ids, mb_prompt_lens, step, grad_accum, clip_param, beta, writer=None, rank=0, param_update=0, rewards=None):
+    """
+    Computes the loss for a micro-batch, performs backward, and steps the optimizer if needed.
+    Returns (loss, param_update, should_break) where should_break is True if loss is non-finite.
+    """
+    logits = engine(mb_sequences).logits
+    full_logps = per_token_logps(logits[:, :-1, :], mb_sequences[:, 1:])
+    gen_len = mb_gen_old.shape[1]
+    curr_logps_list = []
+    for i in range(full_logps.shape[0]):
+        p_len = mb_prompt_lens[i]
+        ans_len = len(mb_ans_token_ids[i])
+        sliced = full_logps[i, p_len - 1 : p_len - 1 + ans_len]
+        padded = F.pad(sliced, (0, gen_len - ans_len), value=-100.0)
+        curr_logps_list.append(padded)
+    curr_logps = torch.stack(curr_logps_list, dim=0)
+
+    # Create mask (based on ans_token_ids) to ignore padding BEFORE computing exponentials
+    mask = torch.zeros(len(mb_ans_token_ids), gen_len, device=engine.device, dtype=torch.float32)
+    for i, toks in enumerate(mb_ans_token_ids):
+        mask[i, : len(toks)] = 1.0
+
+    # Clamp differences to prevent overflow in exp()
+    ratio_diff = torch.clamp(curr_logps - mb_gen_old.detach(), min=-20.0, max=20.0)
+    kl_diff = torch.clamp(mb_ref_logps - curr_logps, min=-20.0, max=20.0)
+
+    # PPO-style loss (same as GRPO) with clamped differences
+    ratios = torch.exp(ratio_diff)
+    clipped = torch.clamp(ratios, 1 - clip_param, 1 + clip_param)
+    pg_loss = -torch.min(ratios * mb_advantages.unsqueeze(-1), clipped * mb_advantages.unsqueeze(-1))
+    kl = torch.exp(kl_diff) - kl_diff - 1
+    per_tok_loss = pg_loss + beta * kl
+
+    loss = ((per_tok_loss * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)).mean()
+    print(f"[DEBUG] loss: {loss.item()}, isfinite={torch.isfinite(loss).item()}")
+    if not torch.isfinite(loss):
+        if rank == 0:
+            print("[Learner][FATAL] Loss became non-finite!", loss.item())
+        return loss, param_update, True
+    engine.backward(loss)
+    # Only update parameters every grad_accum steps
+    if ((step + 1) % grad_accum) == 0:
+        engine.step()
+        grad_norm = engine.get_global_grad_norm()
+        param_update += 1
+        if writer is not None and rank == 0:
+            writer.add_scalar("train/loss", loss.item(), step)
+            if rewards is not None:
+                writer.add_scalar("train/reward_mean", rewards.mean().item(), step)
+                writer.add_scalar("train/reward_std", rewards.std().item(), step)
+            print(f"Step {step+1:05d} | ParamUpdate {param_update:05d} | Loss {loss.item():.4f} | Reward {rewards.mean().item() if rewards is not None else 'N/A':.3f}")
+    return loss, param_update, False
 
 # -------------------------------------------------------------------------------------------------
 # MAIN LEARNER FUNCTION (executed by every rank)
@@ -422,138 +669,18 @@ def main():
             if rank == 0:
                 state_dict_cpu = {k: v.to("cpu") for k, v in engine.module.state_dict().items()}
                 req_q.put({"type": "UPDATE_WEIGHTS", "state_dict": state_dict_cpu}); resp_q.get()
-                item = random.choice(task_items)  # single prompt
-                # Build chat prompt and tokenize
-                system_prompt = "You are a helpful assistant."
-                user_prompt = item["prompt"][0]["content"] if isinstance(item["prompt"], list) else item["prompt"]
-                tip_text = tokenizer.apply_chat_template(
-                    [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-                    tokenize=False, add_generation_prompt=True,
-                )
-                prompt_tokens = tokenizer.encode(tip_text)
-                # Create root segment with dummy actions for prompt tokens
-                root_seg = Segment([Action(tok, 0.0, 0.0, 0.0) for tok in prompt_tokens])
-                all_rollouts = []
-                # --- 1. Initial 5 rollouts from root ---
-                req_q.put({
-                    "type": "GENERATE",
-                    "prefix_ids": root_seg.prefix_ids,
-                    "num_rollouts": 5,
-                    "item": item,
-                })
-                res = resp_q.get()
-                for j in range(len(res["full_sequences"])):
-                    full_seq = res["full_sequences"][j]
-                    gen_part = full_seq[root_seg.length:]
-                    actions = [Action(gen_part[k], res["entropies"][j][k], res["gen_logps"][j][k], res["ref_logps"][j][k]) for k in range(len(gen_part))]
-                    new_segment = Segment(actions, parent=root_seg)
-                    root_seg.children.append(new_segment)
-                    new_segment.propagate_reward(res["rewards"][j])
-                    all_rollouts.append({
-                        "prefix_len": root_seg.length,
-                        "sequence": full_seq,
-                        "reward": res["rewards"][j],
-                        "gen_logps": [a.logp for a in actions],
-                        "ref_logps": [a.ref_logp for a in actions],
-                        "ans_token_ids": [t for t in full_seq[root_seg.length:]],
-                    })
-                # --- 2. 4 rounds of exploitation-only splitting ---
-                for round_idx in range(4):
-                    # Find all leaf segments
-                    all_segments = get_all_segments(root_seg)
-                    leaves = [s for s in all_segments if s.is_leaf and s.length >= 2 * MIN_LEN]
-                    # Compute global mean/std and advantages
-                    rewards = [s.mean for s in leaves if s.rollout_count > 0]
-                    global_mean = sum(rewards) / len(rewards) if rewards else 0.0
-                    global_std = torch.tensor(rewards).std().item() if len(rewards) > 1 else 1.0
-                    for s in leaves:
-                        if s.rollout_count > 0:
-                            s.advantage = (s.mean - global_mean) / (global_std + 1e-8)
-                    # Select best segment to split
-                    candidates = [s for s in leaves if s.advantage >= THETA_A]
-                    if not candidates:
-                        break
-                    seg_to_split = max(candidates, key=lambda s: s.advantage)
-                    split_idx = find_entropy_split(seg_to_split, MIN_LEN)
-                    if split_idx is None:
-                        break
-                    child = seg_to_split.split(split_idx)
-                    # Generate 4 rollouts from the new segment
-                    req_q.put({
-                        "type": "GENERATE",
-                        "prefix_ids": child.prefix_ids,
-                        "num_rollouts": 4,
-                        "item": item,
-                    })
-                    res = resp_q.get()
-                    for j in range(len(res["full_sequences"])):
-                        full_seq = res["full_sequences"][j]
-                        gen_part = full_seq[child.length:]
-                        actions = [Action(gen_part[k], res["entropies"][j][k], res["gen_logps"][j][k], res["ref_logps"][j][k]) for k in range(len(gen_part))]
-                        new_segment = Segment(actions, parent=child)
-                        child.children.append(new_segment)
-                        new_segment.propagate_reward(res["rewards"][j])
-                        all_rollouts.append({
-                            "prefix_len": child.length,
-                            "sequence": full_seq,
-                            "reward": res["rewards"][j],
-                            "gen_logps": [a.logp for a in actions],
-                            "ref_logps": [a.ref_logp for a in actions],
-                            "ans_token_ids": [t for t in full_seq[child.length:]],
-                        })
-                # --- 3. Batch construction ---
-                sequences, rewards, gen_logps, ref_logps, prompt_lens, ans_token_ids = [], [], [], [], [], []
-                for traj in all_rollouts:
-                    sequences.append(traj["sequence"])
-                    rewards.append(traj["reward"])
-                    prompt_lens.append(traj["prefix_len"])
-                    ans_token_ids.append(traj["ans_token_ids"])
-                    gen_logps.append(traj["gen_logps"])
-                    ref_logps.append(traj["ref_logps"])
-                # Pad for batching
-                max_seq_len = max(len(s) for s in sequences)
-                max_gen_len = max(len(l) for l in gen_logps)
-                for s in sequences: s.extend([tokenizer.pad_token_id] * (max_seq_len - len(s)))
-                for l in gen_logps: l.extend([-100.0] * (max_gen_len - len(l)))
-                for l in ref_logps: l.extend([-100.0] * (max_gen_len - len(l)))
-                batch_raw = {
-                    "sequences": sequences, "rewards": rewards, "gen_logps": gen_logps,
-                    "ref_logps": ref_logps, "prompt_lens": prompt_lens,
-                    "ans_token_ids": ans_token_ids,
-                }
+                batch_raw = collect_training_batch(req_q, resp_q, tokenizer, task_items)
             else:
                 batch_raw = None
             # Broadcast batch to all ranks
             obj_list = [batch_raw]; dist.broadcast_object_list(obj_list, src=0)
             if rank != 0:
                 batch_raw = obj_list[0]
-            # Package tensors for the full logical batch
-            sequences = torch.tensor(batch_raw["sequences"], dtype=torch.long, device=engine.device)
-            rewards = torch.tensor(batch_raw["rewards"], dtype=torch.bfloat16, device=engine.device)
-            gen_old = torch.tensor(batch_raw["gen_logps"], dtype=torch.bfloat16, device=engine.device)
-            ref_logps = torch.tensor(batch_raw["ref_logps"], dtype=torch.bfloat16, device=engine.device)
-            prompt_lens = batch_raw["prompt_lens"]
-            ans_token_ids = batch_raw["ans_token_ids"]
-            # Compute advantages over the full batch
-            adv_mean, adv_std = rewards.mean(), rewards.std()
-            advantages = (rewards - adv_mean) / (adv_std + 1e-4)
-            if rank == 0:
+            # Pack micro-batches
+            mb_data, rewards, adv_mean, adv_std = pack_micro_batches(batch_raw, engine, num_micro_batches, micro_batch_size)
+            if rank == 0 and writer is not None:
                 writer.add_scalar("train/reward_mean", rewards.mean().item(), step)
                 writer.add_scalar("train/reward_std", rewards.std().item(), step)
-            # Split the full batch into micro-batches for accumulation
-            mb_data = []
-            for mb_idx in range(num_micro_batches):
-                mb_start = mb_idx * micro_batch_size
-                mb_end = (mb_idx + 1) * micro_batch_size
-                mb_data.append((
-                    sequences[mb_start:mb_end],
-                    rewards[mb_start:mb_end],
-                    gen_old[mb_start:mb_end],
-                    ref_logps[mb_start:mb_end],
-                    advantages[mb_start:mb_end],
-                    ans_token_ids[mb_start:mb_end],
-                    prompt_lens[mb_start:mb_end],
-                ))
         # Now process the next micro-batch
         mb_idx = step % num_micro_batches
         mb_sequences, mb_rewards, mb_gen_old, mb_ref_logps, mb_advantages, mb_ans_token_ids, mb_prompt_lens = mb_data[mb_idx]
@@ -562,75 +689,15 @@ def main():
             print("[WARNING] Skipping empty micro-batch")
             step += 1
             continue
-        # Forward pass
-        logits = engine(mb_sequences).logits
-        full_logps = per_token_logps(logits[:, :-1, :], mb_sequences[:, 1:])
-        # Slice log-probs of generated tokens (variable length handling)
-        gen_len = mb_gen_old.shape[1]
-        curr_logps_list = []
-        for i in range(full_logps.shape[0]):
-            p_len = mb_prompt_lens[i]
-            ans_len = len(mb_ans_token_ids[i])
-            sliced = full_logps[i, p_len - 1 : p_len - 1 + ans_len]
-            padded = F.pad(sliced, (0, gen_len - ans_len), value=-100.0)
-            curr_logps_list.append(padded)
-        curr_logps = torch.stack(curr_logps_list, dim=0)
-
-        # === DEBUG PRINTS START ===
-        def print_stats(name, t):
-            print(f"[DEBUG] {name}: shape={t.shape}, min={t.min().item():.4f}, max={t.max().item():.4f}, mean={t.mean().item():.4f}, std={t.std().item():.4f}, has_nan={torch.isnan(t).any().item()}, has_inf={torch.isinf(t).any().item()}")
-
-        print_stats("curr_logps", curr_logps)
-        print_stats("mb_gen_old", mb_gen_old)
-        print_stats("mb_ref_logps", mb_ref_logps)
-        print_stats("mb_advantages", mb_advantages)
-        print(f"[DEBUG] mb_prompt_lens: {mb_prompt_lens}")
-        print(f"[DEBUG] mb_ans_token_ids (lens): {[len(x) for x in mb_ans_token_ids]}")
-        print(f"[DEBUG] mb_ans_token_ids (sample): {mb_ans_token_ids[0] if len(mb_ans_token_ids) > 0 else 'N/A'}")
-        # === DEBUG PRINTS END ===
-
-        # Create mask (based on ans_token_ids) to ignore padding BEFORE computing exponentials
-        max_ans_len = max(len(x) for x in mb_ans_token_ids)
-        mask = torch.zeros(len(mb_ans_token_ids), max_ans_len, device=engine.device, dtype=torch.float32)
-        for i, toks in enumerate(mb_ans_token_ids):
-            mask[i, : len(toks)] = 1.0
-
-        # Clamp differences to prevent overflow in exp()
-        ratio_diff = torch.clamp(curr_logps - mb_gen_old.detach(), min=-20.0, max=20.0)
-        kl_diff = torch.clamp(mb_ref_logps - curr_logps, min=-20.0, max=20.0)
-
-        # PPO-style loss (same as GRPO) with clamped differences
-        ratios = torch.exp(ratio_diff)
-        clipped = torch.clamp(ratios, 1 - clip_param, 1 + clip_param)
-        pg_loss = -torch.min(ratios * mb_advantages.unsqueeze(-1), clipped * mb_advantages.unsqueeze(-1))
-        kl = torch.exp(kl_diff) - kl_diff - 1
-        per_tok_loss = pg_loss + beta * kl
-
-        # More debug prints
-        print_stats("ratios", ratios)
-        print_stats("clipped", clipped)
-        print_stats("pg_loss", pg_loss)
-        print_stats("kl", kl)
-        print_stats("per_tok_loss", per_tok_loss)
-        print_stats("mask", mask)
-
-        loss = ((per_tok_loss * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)).mean()
-        print(f"[DEBUG] loss: {loss.item()}, isfinite={torch.isfinite(loss).item()}")
-        # Backprop / optimizer step (accumulate gradients)
-        if not torch.isfinite(loss):
-            if rank == 0:
-                print("[Learner][FATAL] Loss became non-finite!", loss.item())
+        # Compute loss and step
+        loss, param_update, should_break = compute_loss_and_step(
+            engine, F,
+            mb_sequences, mb_rewards, mb_gen_old, mb_ref_logps, mb_advantages, mb_ans_token_ids, mb_prompt_lens,
+            step, grad_accum, clip_param, beta,
+            writer=writer if rank == 0 else None, rank=rank, param_update=param_update, rewards=rewards
+        )
+        if should_break:
             break
-        engine.backward(loss)
-        # Only update parameters every grad_accum steps
-        if ((step + 1) % grad_accum) == 0:
-            engine.step()
-            grad_norm = engine.get_global_grad_norm()
-            param_update += 1
-            if rank == 0:
-                writer.add_scalar("train/loss", loss.item(), step)
-                print(f"Step {step+1:05d} | ParamUpdate {param_update:05d} | Loss {loss.item():.4f} | Reward {rewards.mean().item():.3f}")
-        # Optionally, add debug numerics here as before
         step += 1
 
     # Clean up
