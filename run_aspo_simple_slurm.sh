@@ -50,17 +50,11 @@ export LR=1e-5
 # The python script is currently hardcoded for 7 training GPUs via the
 # `num_train_devices = 7` variable. This bash script is configured to
 # match that (7 train + 1 actor = 8 total GPUs).
-# If you change the --gres value, you MUST update the python script.
-NUM_GPUS_REQUESTED=${SLURM_GPUS_ON_NODE:-$(nvidia-smi -L | wc -l)}
-
-# We expect one less GPU for training than total requested
-NUM_TRAIN_GPUS=$((NUM_GPUS_REQUESTED - 1))
-
-# The last GPU is for the actor
-ACTOR_GPU_ID=$((NUM_GPUS_REQUESTED - 1))
-
-# Create the list of GPU IDs for DeepSpeed (e.g., "0,1,2,3,4,5,6")
-TRAIN_GPU_IDS=$(seq -s, 0 $((NUM_TRAIN_GPUS - 1)))
+# We pass all 8 GPUs to DeepSpeed but only use 7 for training.
+# The actor process will use GPU 7 directly.
+NUM_GPUS_REQUESTED=8
+NUM_TRAIN_GPUS=7
+ACTOR_GPU_ID=7
 
 # Path to the script to run
 PYTHON_SCRIPT="aspo_vllm_async_simplified.py"
@@ -71,7 +65,7 @@ PYTHON_SCRIPT="aspo_vllm_async_simplified.py"
 echo "#################################################################"
 echo "Starting DeepSpeed async-simple ASPO job..."
 echo "Total GPUs on node: ${NUM_GPUS_REQUESTED}"
-echo "GPUs for DeepSpeed training: ${NUM_TRAIN_GPUS} (IDs: ${TRAIN_GPU_IDS})"
+echo "GPUs for DeepSpeed training: ${NUM_TRAIN_GPUS} (IDs: 0,1,2,3,4,5,6)"
 echo "GPU for vLLM Actor: ${ACTOR_GPU_ID}"
 echo "Python script: ${PYTHON_SCRIPT}"
 echo "Model: ${MODEL_PATH}"
@@ -82,9 +76,9 @@ echo "#################################################################"
 
 
 # The `deepspeed` command will launch `NUM_TRAIN_GPUS` processes.
-# The `--include` flag tells deepspeed which GPUs to use on `localhost`.
-# The python script (rank 0) will then launch the actor process on the `ACTOR_GPU_ID`.
-deepspeed --include localhost:${TRAIN_GPU_IDS} \
+# We pass all 8 GPUs to DeepSpeed but only use 7 for training.
+# The python script (rank 0) will then launch the actor process on GPU 7.
+deepspeed --include localhost:0,1,2,3,4,5,6,7 \
     ${PYTHON_SCRIPT} \
     --actor_gpu ${ACTOR_GPU_ID} \
     --train_gpus ${NUM_TRAIN_GPUS} \

@@ -9,7 +9,7 @@ from datasets import load_dataset  # type: ignore
 
 def _length_reward_fn(completions: List[str], *, items: List[Dict] = None, **kwargs) -> List[float]:
     """Simple reward: number of whitespace-separated tokens in the completion."""
-    return [float(len(text.split())) for text in completions]
+    return [float(len(text.split())) / 1024.0 for text in completions]
 
 
 # ----------------------------------------------------------------------------

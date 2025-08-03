@@ -145,16 +145,16 @@ def find_entropy_split(segment: Segment, min_len: int) -> Optional[int]:
     for i in range(min_len, segment.length - min_len + 1):
         entropy = segment.actions[i - 1].entropy
         entropies.append((i, entropy))
-        print(f"[find_entropy_split] Checking split at {i}: entropy={entropy:.4f}")
+        # print(f"[find_entropy_split] Checking split at {i}: entropy={entropy:.4f}")
         if entropy > max_entropy:
-            print(f"[find_entropy_split] New max entropy found: {entropy:.4f} at split {i}")
+            # print(f"[find_entropy_split] New max entropy found: {entropy:.4f} at split {i}")
             max_entropy = entropy
             split_idx = i
-    if split_idx != -1:
-        print(f"[find_entropy_split] Best split index: {split_idx} with max entropy {max_entropy:.4f}")
-    else:
-        print(f"[find_entropy_split] No valid split found.")
-    print(f"[find_entropy_split] All candidate entropies: {[(i, f'{e:.4f}') for i, e in entropies]}")
+    # if split_idx != -1:
+    #     # print(f"[find_entropy_split] Best split index: {split_idx} with max entropy {max_entropy:.4f}")
+    # else:
+    #     # print(f"[find_entropy_split] No valid split found.")
+    # print(f"[find_entropy_split] All candidate entropies: {[(i, f'{e:.4f}') for i, e in entropies]}")
     return split_idx if split_idx != -1 else None
 
 # -------------------------------------------------------------------------------------------------
@@ -163,7 +163,7 @@ def find_entropy_split(segment: Segment, min_len: int) -> Optional[int]:
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--actor_gpu", type=int, default=1, help="Global GPU id reserved for the generation actor")
+    parser.add_argument("--actor_gpu", type=int, default=7, help="Global GPU id reserved for the generation actor")
     parser.add_argument("--local_rank", type=int, default=-1, help="(internal) local rank passed by DeepSpeed")
     parser.add_argument("--train_gpus", type=int, default=7, help="Number of training devices (DeepSpeed data parallel)")
 
@@ -251,10 +251,17 @@ def _tensor_stats(t: torch.Tensor):
 
 def actor_process(actor_gpu: int, req_q: mp.Queue, resp_q: mp.Queue, max_gen_tokens: int):
     # Ensure this process only sees the actor GPU
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(actor_gpu)
+    # All 8 GPUs are now visible to this process (0-7)
+    # The actor will use GPU 7 directly
     import torch  # re-import under the new CUDA context
 
-    actor_device = torch.device("cuda:0")
+    # Use GPU 7 for the actor
+    actor_device = torch.device("cuda:7")
+
+    # Print some debugging information
+    print(f"[ACTOR DEBUG] Using GPU 7 for actor")
+    print(f"[ACTOR DEBUG] Visible devices: {torch.cuda.device_count()}")
+    print(f"[ACTOR DEBUG] Device name (cuda:7): {torch.cuda.get_device_name(7)}")
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     if tokenizer.pad_token_id is None:
@@ -369,6 +376,7 @@ def actor_process(actor_gpu: int, req_q: mp.Queue, resp_q: mp.Queue, max_gen_tok
                 "prompt_len": prompt_len,
                 "ans_token_ids": ans_token_ids.cpu().tolist(),
                 "answers": answers,
+                "prompt_text": msg.get("prompt_text", None),
             })
         else:
             raise RuntimeError(f"Unknown msg type {mtype}")
@@ -407,6 +415,8 @@ def generate_rollouts(req_q, resp_q, segment, num_rollouts, item):
             "ref_logps": res["ref_logps"][j],
             "ans_token_ids": gen_part,
             "prefix_len": prefix_len,
+            "answer": res["answers"][j],
+            "prompt": res.get("prompt_text", None),
         })
     return rollouts
 
@@ -417,6 +427,7 @@ def split_segments(root_seg, item, req_q, resp_q):
     Returns all rollouts collected during splitting.
     """
     all_rollouts = []
+    # TODO eventually 4 will be hyperparam rather than hardcoded
     for round_idx in range(4):
         all_segments = get_all_segments(root_seg)
         leaves = [s for s in all_segments if s.is_leaf and s.length >= 2 * MIN_LEN]
@@ -447,6 +458,8 @@ def split_segments(root_seg, item, req_q, resp_q):
                 "gen_logps": rollout["gen_logps"],
                 "ref_logps": rollout["ref_logps"],
                 "ans_token_ids": rollout["ans_token_ids"],
+                "answer": rollout["answer"],
+                "prompt": rollout["prompt"],
             })
     return all_rollouts
 
@@ -455,7 +468,7 @@ def construct_training_batch(all_rollouts, tokenizer):
     """
     Pads and packages the rollouts into a batch dictionary for training.
     """
-    sequences, rewards, gen_logps, ref_logps, prompt_lens, ans_token_ids = [], [], [], [], [], []
+    sequences, rewards, gen_logps, ref_logps, prompt_lens, ans_token_ids, answers, prompts = [], [], [], [], [], [], [], []
     for traj in all_rollouts:
         sequences.append(traj["sequence"])
         rewards.append(traj["reward"])
@@ -463,6 +476,8 @@ def construct_training_batch(all_rollouts, tokenizer):
         ans_token_ids.append(traj["ans_token_ids"])
         gen_logps.append(traj["gen_logps"])
         ref_logps.append(traj["ref_logps"])
+        answers.append(traj.get("answer", ""))
+        prompts.append(traj.get("prompt", ""))
     max_seq_len = max(len(s) for s in sequences)
     max_gen_len = max(len(l) for l in gen_logps)
     for s in sequences: s.extend([tokenizer.pad_token_id] * (max_seq_len - len(s)))
@@ -472,6 +487,8 @@ def construct_training_batch(all_rollouts, tokenizer):
         "sequences": sequences, "rewards": rewards, "gen_logps": gen_logps,
         "ref_logps": ref_logps, "prompt_lens": prompt_lens,
         "ans_token_ids": ans_token_ids,
+        "answers": answers,
+        "prompts": prompts,
     }
 
 def collect_training_batch(req_q, resp_q, tokenizer, task_items):
@@ -507,6 +524,8 @@ def collect_training_batch(req_q, resp_q, tokenizer, task_items):
             "gen_logps": rollout["gen_logps"],
             "ref_logps": rollout["ref_logps"],
             "ans_token_ids": rollout["ans_token_ids"],
+            "answer": rollout["answer"],
+            "prompt": rollout["prompt"],
         }
         for rollout in initial_rollouts
     ]
@@ -681,6 +700,45 @@ def main():
             if rank == 0 and writer is not None:
                 writer.add_scalar("train/reward_mean", rewards.mean().item(), step)
                 writer.add_scalar("train/reward_std", rewards.std().item(), step)
+                # --- Generation stats logging (gen/) ---
+                answers = batch_raw["answers"]
+                prompts = batch_raw["prompts"]
+                ans_token_ids = batch_raw["ans_token_ids"]
+                rewards_tensor = torch.tensor(batch_raw["rewards"])
+                completion_lengths = torch.tensor([len(x) for x in ans_token_ids], dtype=torch.float32)
+                writer.add_scalar("gen/rewards_mean", rewards_tensor.mean().item(), step)
+                writer.add_scalar("gen/rewards_std", rewards_tensor.std().item(), step)
+                writer.add_scalar("gen/rewards_min", rewards_tensor.min().item(), step)
+                writer.add_scalar("gen/rewards_max", rewards_tensor.max().item(), step)
+                writer.add_scalar("gen/completion/mean_length", completion_lengths.mean().item(), step)
+                writer.add_scalar("gen/completion/min_length", completion_lengths.min().item(), step)
+                writer.add_scalar("gen/completion/max_length", completion_lengths.max().item(), step)
+                # --- Per-prompt reward/advantage stats ---
+                num_prompts_in_batch = len(set(prompts)) if prompts else 1
+                num_rollouts_per_prompt = len(rewards) // num_prompts_in_batch
+                rewards_per_prompt = rewards_tensor.view(num_prompts_in_batch, num_rollouts_per_prompt)
+                mean_per_prompt = rewards_per_prompt.mean(dim=1, keepdim=True)
+                std_per_prompt = rewards_per_prompt.std(dim=1, keepdim=True)
+                advantages_per_prompt = (rewards_per_prompt - mean_per_prompt) / (std_per_prompt + 1e-4)
+                writer.add_scalar("train/rewards_per_prompt/mean", mean_per_prompt.mean().item(), step)
+                writer.add_scalar("train/rewards_per_prompt/std", std_per_prompt.mean().item(), step)
+                writer.add_scalar("train/advantages_per_prompt/mean", advantages_per_prompt.mean().item(), step)
+                writer.add_scalar("train/advantages_per_prompt/std", advantages_per_prompt.std().item(), step)
+                # --- Text table logging ---
+                advantages_for_logging = advantages_per_prompt.flatten()
+                S = ""
+                for p_idx in range(num_prompts_in_batch):
+                    prompt_text = prompts[p_idx] if prompts else ""
+                    S += f"Prompt: {prompt_text}<br><br>"
+                    for r_idx in range(num_rollouts_per_prompt):
+                        ans_idx = p_idx * num_rollouts_per_prompt + r_idx
+                        answer_text = answers[ans_idx] if answers else ""
+                        reward_val = rewards_tensor[ans_idx].item()
+                        adv_val = advantages_for_logging[ans_idx].item()
+                        S += f"Answer: {answer_text}<br><br>"
+                        S += f"Reward: {reward_val}<br><br>"
+                        S += f"Advantage: {adv_val}<br><br>"
+                writer.add_text("generations", S, step)
         # Now process the next micro-batch
         mb_idx = step % num_micro_batches
         mb_sequences, mb_rewards, mb_gen_old, mb_ref_logps, mb_advantages, mb_ans_token_ids, mb_prompt_lens = mb_data[mb_idx]
@@ -696,6 +754,32 @@ def main():
             step, grad_accum, clip_param, beta,
             writer=writer if rank == 0 else None, rank=rank, param_update=param_update, rewards=rewards
         )
+        # --- Additional logging for ratios, pg_loss, kl stats (match GRPO) ---
+        if rank == 0 and writer is not None:
+            # Recompute for logging (match compute_loss_and_step)
+            with torch.no_grad():
+                gen_len = mb_gen_old.shape[1]
+                curr_logps_list = []
+                for i in range(mb_sequences.shape[0]):
+                    p_len = mb_prompt_lens[i]
+                    ans_len = len(mb_ans_token_ids[i])
+                    sliced = per_token_logps(engine(mb_sequences).logits[:, :-1, :], mb_sequences[:, 1:])[i, p_len - 1 : p_len - 1 + ans_len]
+                    padded = F.pad(sliced, (0, gen_len - ans_len), value=-100.0)
+                    curr_logps_list.append(padded)
+                curr_logps = torch.stack(curr_logps_list, dim=0)
+                ratio_diff = torch.clamp(curr_logps - mb_gen_old.detach(), min=-20.0, max=20.0)
+                ratios = torch.exp(ratio_diff)
+                clipped = torch.clamp(ratios, 1 - clip_param, 1 + clip_param)
+                advantages = mb_advantages.unsqueeze(-1)
+                pg_loss = -torch.min(ratios * advantages, clipped * advantages)
+                kl_diff = torch.clamp(mb_ref_logps - curr_logps, min=-20.0, max=20.0)
+                kl = torch.exp(kl_diff) - kl_diff - 1
+                writer.add_scalar("train/ratios/mean", ratios.mean().item(), step)
+                writer.add_scalar("train/ratios/std", ratios.std().item(), step)
+                writer.add_scalar("train/pg_loss/mean", pg_loss.mean().item(), step)
+                writer.add_scalar("train/pg_loss/std", pg_loss.std().item(), step)
+                writer.add_scalar("train/kl/mean", kl.mean().item(), step)
+                writer.add_scalar("train/kl/std", kl.std().item(), step)
         if should_break:
             break
         step += 1
