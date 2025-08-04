@@ -5,7 +5,7 @@ Communicates with actor.py via torch.distributed
 
 import os, random, time, json, argparse
 from typing import List, Dict, Any
-import pickle
+# REMOVED: import pickle
 
 import torch
 import torch.nn.functional as F
@@ -80,198 +80,107 @@ mixed_precision_policy = MixedPrecision(
 # Communication utilities
 # ----------------------------------------------------------------------------------
 
-def send_object(obj, dst_rank, tag=0):
-    """Send a small control message/metadata to another rank via torch.distributed.
-    
-    WARNING: Only use for small control messages (acks, requests, metadata).
-    For heavy payloads like state dicts or batches, use tensor-based communication!
+def send_metadata(meta: dict, dst_rank, tag=0):
     """
-    data = pickle.dumps(obj)
-    
-    # Send size first
-    size_tensor = torch.tensor([len(data)], dtype=torch.long, device=torch.cuda.current_device())
-    dist.send(size_tensor, dst=dst_rank, tag=tag)
-    
-    # Send data
-    data_tensor = torch.tensor(list(data), dtype=torch.uint8, device=torch.cuda.current_device())
-    dist.send(data_tensor, dst=dst_rank, tag=tag)
-
-def recv_object(src_rank, tag=0):
-    """Receive a small control message/metadata from another rank via torch.distributed.
-    
-    WARNING: Only use for small control messages (acks, requests, metadata).
-    For heavy payloads like state dicts or batches, use tensor-based communication!
+    Send a metadata dict using only tensor communication (as a JSON string tensor).
     """
     device = torch.cuda.current_device()
-    
-    # Receive size
-    size_tensor = torch.empty([1], dtype=torch.long, device=device)
-    dist.recv(size_tensor, src=src_rank, tag=tag)
-    size = size_tensor[0].item()
-    
-    # Receive data
-    data_tensor = torch.empty([size], dtype=torch.uint8, device=device)
-    dist.recv(data_tensor, src=src_rank, tag=tag)
-    
-    # Deserialize
-    data = bytes(data_tensor.cpu().tolist())
-    return pickle.loads(data)
+    meta_str = json.dumps(meta)
+    meta_bytes = meta_str.encode('utf-8')
+    meta_len = torch.tensor([len(meta_bytes)], dtype=torch.long, device=device)
+    dist.send(meta_len, dst=dst_rank, tag=tag)
+    meta_tensor = torch.tensor(list(meta_bytes), dtype=torch.uint8, device=device)
+    dist.send(meta_tensor, dst=dst_rank, tag=tag+1)
 
-def send_state_dict(state_dict, dst_rank, tag=0):
-    """Send a state dict using direct tensor communication (much faster than pickle)"""
+def recv_metadata(src_rank, tag=0):
+    """
+    Receive a metadata dict using only tensor communication (as a JSON string tensor).
+    """
     device = torch.cuda.current_device()
-    
-    # Send number of tensors
-    num_tensors = len(state_dict)
-    count_tensor = torch.tensor([num_tensors], dtype=torch.long, device=device)
-    dist.send(count_tensor, dst=dst_rank, tag=tag)
-    
-    # Send each tensor
-    tag_offset = 1
-    for i, (name, tensor) in enumerate(state_dict.items()):
-        # Send tensor name length and name
-        name_bytes = name.encode('utf-8')
-        name_len = torch.tensor([len(name_bytes)], dtype=torch.long, device=device)
-        dist.send(name_len, dst=dst_rank, tag=tag + tag_offset)
-        tag_offset += 1
-        
-        name_tensor = torch.tensor(list(name_bytes), dtype=torch.uint8, device=device)
-        dist.send(name_tensor, dst=dst_rank, tag=tag + tag_offset)
-        tag_offset += 1
-        
-        # Send tensor shape length and shape
-        shape = list(tensor.shape)
-        shape_len = torch.tensor([len(shape)], dtype=torch.long, device=device)
-        dist.send(shape_len, dst=dst_rank, tag=tag + tag_offset)
-        tag_offset += 1
-        
-        shape_tensor = torch.tensor(shape, dtype=torch.long, device=device)
-        dist.send(shape_tensor, dst=dst_rank, tag=tag + tag_offset)
-        tag_offset += 1
-        
-        # Send tensor dtype info
-        dtype_info = torch.tensor([0 if tensor.dtype == torch.bfloat16 else 1], dtype=torch.long, device=device)
-        dist.send(dtype_info, dst=dst_rank, tag=tag + tag_offset)
-        tag_offset += 1
-        
-        # Send tensor data directly (keep on GPU if possible)
-        tensor_gpu = tensor.to(device)
-        dist.send(tensor_gpu.contiguous(), dst=dst_rank, tag=tag + tag_offset)
-        tag_offset += 1
+    meta_len = torch.empty([1], dtype=torch.long, device=device)
+    dist.recv(meta_len, src=src_rank, tag=tag)
+    meta_len = meta_len.item()
+    meta_tensor = torch.empty([meta_len], dtype=torch.uint8, device=device)
+    dist.recv(meta_tensor, src=src_rank, tag=tag+1)
+    meta_bytes = bytes(meta_tensor.cpu().tolist())
+    meta_str = meta_bytes.decode('utf-8')
+    return json.loads(meta_str)
 
-def recv_state_dict(src_rank, tag=0):
-    """Receive a state dict using direct tensor communication"""
+def broadcast_state_dict(state_dict, src_rank, dst_rank, tag_base=0):
+    """
+    Broadcast a state dict from src_rank to dst_rank (point-to-point, not collective).
+    All ranks must call this function. Only src_rank provides state_dict, dst_rank receives.
+    """
     device = torch.cuda.current_device()
-    
-    # Receive number of tensors
-    count_tensor = torch.empty([1], dtype=torch.long, device=device)
-    dist.recv(count_tensor, src=src_rank, tag=tag)
-    num_tensors = count_tensor[0].item()
-    
-    state_dict = {}
-    
-    # Receive each tensor
-    tag_offset = 1
-    for i in range(num_tensors):
-        # Receive tensor name
-        name_len_tensor = torch.empty([1], dtype=torch.long, device=device)
-        dist.recv(name_len_tensor, src=src_rank, tag=tag + tag_offset)
-        tag_offset += 1
-        name_len = name_len_tensor[0].item()
-        
-        name_tensor = torch.empty([name_len], dtype=torch.uint8, device=device)
-        dist.recv(name_tensor, src=src_rank, tag=tag + tag_offset)
-        tag_offset += 1
-        name = bytes(name_tensor.cpu().tolist()).decode('utf-8')
-        
-        # Receive tensor shape
-        shape_len_tensor = torch.empty([1], dtype=torch.long, device=device)
-        dist.recv(shape_len_tensor, src=src_rank, tag=tag + tag_offset)
-        tag_offset += 1
-        shape_len = shape_len_tensor[0].item()
-        
-        shape_tensor = torch.empty([shape_len], dtype=torch.long, device=device)
-        dist.recv(shape_tensor, src=src_rank, tag=tag + tag_offset)
-        tag_offset += 1
-        actual_shape = [dim.item() for dim in shape_tensor]
-        
-        # Receive tensor dtype info
-        dtype_tensor = torch.empty([1], dtype=torch.long, device=device)
-        dist.recv(dtype_tensor, src=src_rank, tag=tag + tag_offset)
-        tag_offset += 1
-        dtype = torch.bfloat16 if dtype_tensor[0].item() == 0 else torch.float32
-        
-        # Receive tensor data
-        tensor = torch.empty(actual_shape, dtype=dtype, device=device)
-        dist.recv(tensor, src=src_rank, tag=tag + tag_offset)
-        tag_offset += 1
-        
-        state_dict[name] = tensor
-    
-    return state_dict
+    # 1. On src, create metadata: list of (name, shape, dtype)
+    if dist.get_rank() == src_rank:
+        keys = list(state_dict.keys())
+        shapes = [list(t.shape) for t in state_dict.values()]
+        dtypes = [str(t.dtype) for t in state_dict.values()]
+        meta = {"keys": keys, "shapes": shapes, "dtypes": dtypes}
+        send_metadata(meta, dst_rank=dst_rank, tag=tag_base)
+    elif dist.get_rank() == dst_rank:
+        meta = recv_metadata(src_rank=src_rank, tag=tag_base)
+    else:
+        return None  # Only src and dst participate
+    # 2. Broadcast each tensor in order
+    tensors = []
+    for i, (name, shape, dtype_str) in enumerate(zip(meta["keys"], meta["shapes"], meta["dtypes"])):
+        dtype = getattr(torch, dtype_str.split('.')[-1])
+        if dist.get_rank() == src_rank:
+            tensor = state_dict[name].to(device)
+            dist.send(tensor, dst=dst_rank, tag=tag_base+10+i)
+        elif dist.get_rank() == dst_rank:
+            tensor = torch.empty(shape, dtype=dtype, device=device)
+            dist.recv(tensor, src=src_rank, tag=tag_base+10+i)
+            tensors.append(tensor)
+    if dist.get_rank() == dst_rank:
+        state_dict = {k: t for k, t in zip(meta["keys"], tensors)}
+        return state_dict
+    return None
 
 def send_batch(batch, dst_rank, tag=0):
-    """Send a batch using direct tensor communication (much faster than pickle)"""
     device = torch.cuda.current_device()
-    
     # Convert lists to tensors and send them
     sequences = torch.tensor(batch["sequences"], dtype=torch.long, device=device)
     rewards = torch.tensor(batch["rewards"], dtype=torch.float32, device=device)
     gen_logps = torch.tensor(batch["gen_logps"], dtype=torch.float32, device=device)
     ref_logps = torch.tensor(batch["ref_logps"], dtype=torch.float32, device=device)
-    
-    # Send tensor shapes first
-    dist.send(torch.tensor(sequences.shape, dtype=torch.long, device=device), dst=dst_rank, tag=tag)
-    dist.send(torch.tensor(rewards.shape, dtype=torch.long, device=device), dst=dst_rank, tag=tag+1)
-    dist.send(torch.tensor(gen_logps.shape, dtype=torch.long, device=device), dst=dst_rank, tag=tag+2)
-    dist.send(torch.tensor(ref_logps.shape, dtype=torch.long, device=device), dst=dst_rank, tag=tag+3)
-    
-    # Send tensors
+    # Send tensor shapes first as metadata
+    meta = {
+        "shapes": {
+            "sequences": list(sequences.shape),
+            "rewards": list(rewards.shape),
+            "gen_logps": list(gen_logps.shape),
+            "ref_logps": list(ref_logps.shape)
+        },
+        "metadata": {
+            "prompt_lens": batch["prompt_lens"],
+            "prompts": batch["prompts"],
+            "answers": batch["answers"],
+            "ans_token_ids": batch["ans_token_ids"],
+            "gen_time": batch["gen_time"]
+        }
+    }
+    send_metadata(meta, dst_rank=dst_rank, tag=tag)
     dist.send(sequences, dst=dst_rank, tag=tag+10)
     dist.send(rewards, dst=dst_rank, tag=tag+11)
     dist.send(gen_logps, dst=dst_rank, tag=tag+12)
     dist.send(ref_logps, dst=dst_rank, tag=tag+13)
-    
-    # Send metadata using send_object (small control data)
-    metadata = {
-        "prompt_lens": batch["prompt_lens"],
-        "prompts": batch["prompts"],
-        "answers": batch["answers"],
-        "ans_token_ids": batch["ans_token_ids"],
-        "gen_time": batch["gen_time"]
-    }
-    send_object(metadata, dst_rank, tag=tag+20)
 
 def recv_batch(src_rank, tag=0):
-    """Receive a batch using direct tensor communication"""
     device = torch.cuda.current_device()
-    
-    # Receive tensor shapes
-    seq_shape_tensor = torch.empty([2], dtype=torch.long, device=device)
-    reward_shape_tensor = torch.empty([1], dtype=torch.long, device=device)
-    gen_logps_shape_tensor = torch.empty([2], dtype=torch.long, device=device)
-    ref_logps_shape_tensor = torch.empty([2], dtype=torch.long, device=device)
-    
-    dist.recv(seq_shape_tensor, src=src_rank, tag=tag)
-    dist.recv(reward_shape_tensor, src=src_rank, tag=tag+1)
-    dist.recv(gen_logps_shape_tensor, src=src_rank, tag=tag+2)
-    dist.recv(ref_logps_shape_tensor, src=src_rank, tag=tag+3)
-    
-    # Receive tensors
-    sequences = torch.empty(seq_shape_tensor.tolist(), dtype=torch.long, device=device)
-    rewards = torch.empty(reward_shape_tensor.tolist(), dtype=torch.float32, device=device)
-    gen_logps = torch.empty(gen_logps_shape_tensor.tolist(), dtype=torch.float32, device=device)
-    ref_logps = torch.empty(ref_logps_shape_tensor.tolist(), dtype=torch.float32, device=device)
-    
+    meta = recv_metadata(src_rank=src_rank, tag=tag)
+    shapes = meta["shapes"]
+    metadata = meta["metadata"]
+    sequences = torch.empty(shapes["sequences"], dtype=torch.long, device=device)
+    rewards = torch.empty(shapes["rewards"], dtype=torch.float32, device=device)
+    gen_logps = torch.empty(shapes["gen_logps"], dtype=torch.float32, device=device)
+    ref_logps = torch.empty(shapes["ref_logps"], dtype=torch.float32, device=device)
     dist.recv(sequences, src=src_rank, tag=tag+10)
     dist.recv(rewards, src=src_rank, tag=tag+11)
     dist.recv(gen_logps, src=src_rank, tag=tag+12)
     dist.recv(ref_logps, src=src_rank, tag=tag+13)
-    
-    # Receive metadata
-    metadata = recv_object(src_rank, tag=tag+20)
-    
-    # Reconstruct batch
     batch = {
         "sequences": sequences.cpu().tolist(),
         "rewards": rewards.cpu().tolist(),
@@ -283,7 +192,6 @@ def recv_batch(src_rank, tag=0):
         "ans_token_ids": metadata["ans_token_ids"],
         "gen_time": metadata["gen_time"]
     }
-    
     return batch
 
 # ----------------------------------------------------------------------------------
@@ -335,57 +243,40 @@ def run_actor_role(actor_rank, world_size, model_path, task_name, master_addr, m
     try:
         while True:
             step += 1
-            print(f"[ACTOR] Step {step}: Waiting for shards from all trainer ranks...")
+            print(f"[ACTOR] Step {step}: Waiting for message from rank 0...")
             
-            # Receive state dict from rank 0 using proper tensor communication
-            print(f"[ACTOR] Step {step}: Waiting for control message from rank 0...")
-            msg = recv_object(src_rank=0, tag=step*10)
-            print(f"[ACTOR] Step {step}: Received control message from rank 0")
+            # First check if this is a STOP signal
+            try:
+                # Try to receive a control message first (could be STOP or state dict metadata)
+                msg = recv_metadata(src_rank=0, tag=step*100)
+                if msg.get("type") == "STOP":
+                    print(f"[ACTOR] Received STOP signal, shutting down")
+                    return
+                elif msg.get("type") == "STATE_DICT":
+                    print(f"[ACTOR] Step {step}: Receiving state dict from rank 0...")
+                    # Continue with state dict reception
+                else:
+                    print(f"[ACTOR] Warning: Unknown message type: {msg}")
+                    continue
+            except Exception as e:
+                print(f"[ACTOR] Error receiving control message: {e}")
+                break
             
-            if msg["type"] == "STOP":
-                print(f"[ACTOR] Received STOP signal, shutting down")
-                return
-            elif msg["type"] == "UPDATE_WEIGHTS":
-                print(f"[ACTOR] Step {step}: Receiving {msg['num_tensors']} tensors...")
-                
-                # Receive each tensor using proper PyTorch distributed communication
-                state_dict = {}
-                for i in range(msg["num_tensors"]):
-                    # Receive tensor metadata
-                    tensor_info = recv_object(src_rank=0, tag=step*10 + i*3 + 1)
-                    name = tensor_info["name"]
-                    shape = tensor_info["shape"]
-                    dtype_str = tensor_info["dtype"]
-                    
-                    # Convert dtype string back to dtype
-                    if "bfloat16" in dtype_str:
-                        dtype = torch.bfloat16
-                    elif "float32" in dtype_str:
-                        dtype = torch.float32
-                    elif "int64" in dtype_str:
-                        dtype = torch.int64
-                    else:
-                        dtype = torch.float32  # fallback
-                    
-                    # Receive actual tensor using dist.recv
-                    tensor = torch.empty(shape, dtype=dtype, device=device)
-                    dist.recv(tensor, src=0, tag=step*10 + i*3 + 2)
-                    
-                    state_dict[name] = tensor
-                
-                print(f"[ACTOR] Step {step}: Received all tensors, loading into model...")
-                model_gen.load_state_dict(state_dict)
-                print(f"[ACTOR] Step {step}: Weights updated")
-            else:
-                raise RuntimeError(f"Unknown message type: {msg['type']}")
-            
+            # Receive state dict from rank 0
+            state_dict = broadcast_state_dict(None, src_rank=0, dst_rank=actor_rank, tag_base=step*100+10)
+            if state_dict is None:
+                continue
+            print(f"[ACTOR] Step {step}: Received all tensors, loading into model...")
+            model_gen.load_state_dict(state_dict)
+            print(f"[ACTOR] Step {step}: Weights updated")
             # Send acknowledgment to rank 0
-            send_object({"status": "OK"}, dst_rank=0, tag=step*10+100)
+            ack = {"status": "OK"}
+            send_metadata(ack, dst_rank=0, tag=step*100+99)
             print(f"[ACTOR] Step {step}: Sent ack to rank 0")
             
             # Wait for generation request
             print(f"[ACTOR] Step {step}: Waiting for generation request...")
-            gen_msg = recv_object(src_rank=0, tag=step*10+2)
+            gen_msg = recv_metadata(src_rank=0, tag=step*100+5)
             print(f"[ACTOR] Step {step}: Received generation request: {gen_msg}")
             assert gen_msg["type"] == "GENERATE", f"Expected GENERATE, got {gen_msg['type']}"
             
@@ -418,7 +309,7 @@ def run_actor_role(actor_rank, world_size, model_path, task_name, master_addr, m
             ref_logps = torch.tensor(batch["ref_logps"], dtype=torch.float32, device=device)
             
             # Send tensor shapes first as control message
-            send_object({
+            send_metadata({
                 "shapes": {
                     "sequences": list(sequences.shape),
                     "rewards": list(rewards.shape),
@@ -432,13 +323,13 @@ def run_actor_role(actor_rank, world_size, model_path, task_name, master_addr, m
                     "ans_token_ids": batch["ans_token_ids"],
                     "gen_time": batch["gen_time"]
                 }
-            }, dst_rank=0, tag=step*10+3)
+            }, dst_rank=0, tag=step*100+20)
             
             # Send tensors
-            dist.send(sequences, dst=0, tag=step*10+10)
-            dist.send(rewards, dst=0, tag=step*10+11) 
-            dist.send(gen_logps, dst=0, tag=step*10+12)
-            dist.send(ref_logps, dst=0, tag=step*10+13)
+            dist.send(sequences, dst=0, tag=step*100+30)
+            dist.send(rewards, dst=0, tag=step*100+31) 
+            dist.send(gen_logps, dst=0, tag=step*100+32)
+            dist.send(ref_logps, dst=0, tag=step*100+33)
             
             print(f"[ACTOR] Step {step}: Batch sent")
     except Exception as e:
@@ -655,18 +546,10 @@ def main():
             print(f"[GRPO] Rank {extended_rank}: Sending state dict to actor...")
             
             # Send control message first
-            send_object({"type": "UPDATE_WEIGHTS", "num_tensors": len(full_state_dict)}, 
-                       dst_rank=7, tag=step*10)
+            send_metadata({"type": "STATE_DICT"}, dst_rank=7, tag=step*100)
             
-            # Send each tensor using proper PyTorch distributed communication
-            for i, (name, tensor) in enumerate(full_state_dict.items()):
-                # Send tensor name as small control message
-                send_object({"name": name, "shape": list(tensor.shape), "dtype": str(tensor.dtype)}, 
-                           dst_rank=7, tag=step*10 + i*3 + 1)
-                
-                # Send actual tensor data using dist.send
-                tensor_gpu = tensor.cuda()  # Ensure on GPU for NCCL
-                dist.send(tensor_gpu, dst=7, tag=step*10 + i*3 + 2)
+            # Send state dict to actor (rank 7)
+            broadcast_state_dict(full_state_dict, src_rank=0, dst_rank=7, tag_base=step*100+10)
             
             print(f"[GRPO] Rank {extended_rank}: Sent state dict to actor")
         else:
@@ -679,25 +562,26 @@ def main():
         # Only rank 0 waits for acknowledgment (actor will send it after collecting all shards)
         if extended_rank == 0:
             print(f"[GRPO] Step {step}: Waiting for ack from actor...")
-            ack = recv_object(src_rank=7, tag=step*10+100)  # Use offset tag for ack
+            ack = recv_metadata(src_rank=7, tag=step*100+99)  # Use offset tag for ack
             print(f"[GRPO] Step {step}: Got ack: {ack}")
             assert ack["status"] == "OK", "Actor failed to update weights"
             
             # Request batch generation
             print(f"[GRPO] Step {step}: Requesting batch from actor...")
-            send_object({
+            gen_msg = {
                 "type": "GENERATE", 
                 "num_rollouts": num_rollouts,
                 "num_prompts": num_prompts,
                 "max_gen_tokens": max_gen_tokens
-            }, dst_rank=7, tag=step*10+2)
+            }
+            send_metadata(gen_msg, dst_rank=7, tag=step*100+5)
             print(f"[GRPO] Step {step}: Sent batch request, waiting for batch...")
             
             # Receive batch using tensor communication
             print(f"[GRPO] Step {step}: Receiving batch from actor...")
             
             # Receive shapes and metadata first
-            batch_info = recv_object(src_rank=7, tag=step*10+3)
+            batch_info = recv_metadata(src_rank=7, tag=step*100+20)
             shapes = batch_info["shapes"]
             metadata = batch_info["metadata"]
             
@@ -708,10 +592,10 @@ def main():
             gen_logps = torch.empty(shapes["gen_logps"], dtype=torch.float32, device=device)
             ref_logps = torch.empty(shapes["ref_logps"], dtype=torch.float32, device=device)
             
-            dist.recv(sequences, src=7, tag=step*10+10)
-            dist.recv(rewards, src=7, tag=step*10+11)
-            dist.recv(gen_logps, src=7, tag=step*10+12)
-            dist.recv(ref_logps, src=7, tag=step*10+13)
+            dist.recv(sequences, src=7, tag=step*100+30)
+            dist.recv(rewards, src=7, tag=step*100+31)
+            dist.recv(gen_logps, src=7, tag=step*100+32)
+            dist.recv(ref_logps, src=7, tag=step*100+33)
             
             # Reconstruct batch dict
             batch = {
@@ -745,7 +629,13 @@ def main():
             metadata = {
                 "prompt_lens": batch["prompt_lens"],
                 "ans_token_ids": batch["ans_token_ids"],
-                "prompts": batch["prompts"]
+                "prompts": batch["prompts"],
+                "shapes": {
+                    "sequences": list(sequences.shape),
+                    "rewards": list(rewards.shape),
+                    "gen_old": list(gen_old.shape),
+                    "ref_logps": list(ref_logps.shape)
+                }
             }
             obj_list = [metadata]
             dist.broadcast_object_list(obj_list, src=0, group=trainer_group)
@@ -758,17 +648,17 @@ def main():
             
         else:
             # Other ranks receive broadcasts
-            # Receive metadata
+            # Receive metadata first to get shapes
             obj_list = [None]
             dist.broadcast_object_list(obj_list, src=0, group=trainer_group)
             metadata = obj_list[0]
+            shapes = metadata["shapes"]
             
-            # Create empty tensors with the right shapes (we'll get the shapes from rank 0's broadcast)
-            # For now, use dummy tensors - the broadcast will resize them appropriately
-            sequences = torch.empty(1, dtype=torch.long, device=device)
-            rewards = torch.empty(1, dtype=torch.float32, device=device)
-            gen_old = torch.empty(1, dtype=torch.float32, device=device)
-            ref_logps = torch.empty(1, dtype=torch.float32, device=device)
+            # Create tensors with the correct shapes from metadata
+            sequences = torch.empty(shapes["sequences"], dtype=torch.long, device=device)
+            rewards = torch.empty(shapes["rewards"], dtype=torch.float32, device=device)
+            gen_old = torch.empty(shapes["gen_old"], dtype=torch.float32, device=device)
+            ref_logps = torch.empty(shapes["ref_logps"], dtype=torch.float32, device=device)
             
             # Receive tensor broadcasts
             dist.broadcast(sequences, src=0, group=trainer_group)
@@ -866,7 +756,7 @@ def main():
     # Cleanup - send stop signal to actor (only rank 0)
     if extended_rank == 0:
         print(f"[GRPO] Rank {extended_rank}: Sending stop signal to actor...")
-        send_object({"type": "STOP"}, dst_rank=7, tag=99999*10)
+        send_metadata({"type": "STOP"}, dst_rank=7, tag=(args.steps+1)*100)
         print(f"[GRPO] Rank {extended_rank}: Sent stop signal to actor")
     
     # Proper cleanup
