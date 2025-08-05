@@ -43,6 +43,7 @@ def get_args():
     # Coordination parameters
     parser.add_argument("--master_addr", type=str, default="localhost")
     parser.add_argument("--master_port", type=str, default="29500")
+    parser.add_argument("--job_id", type=str, default=None, help="SLURM job ID for logging")
     
     return parser.parse_args()
 
@@ -523,9 +524,11 @@ def main():
 
     if extended_rank == 0:
         print(f"[GRPO] Creating SummaryWriter and logging args")
-        writer = SummaryWriter(f"runs/grpo_distributed_{time.strftime('%Y%m%d-%H%M%S')}")
-        # Log args
-        writer.add_text("args", json.dumps(vars(args)))
+        logdir = f"runs/grpo_distributed_{args.job_id}" if args.job_id is not None else f"runs/grpo_distributed_{time.strftime('%Y%m%d-%H%M%S')}"
+        writer = SummaryWriter(logdir)
+        # Log each CLI arg as a separate text entry
+        for k, v in vars(args).items():
+            writer.add_text(f"args/{k}", str(v))
 
     # Wait for actor to be ready
     print(f"[GRPO] Rank {extended_rank} waiting for actor to be ready (barrier)...")
@@ -736,20 +739,60 @@ def main():
         # Logging (rank 0 only)
         if extended_rank == 0:
             print(f"Step: {step:05d} | Loss: {loss.item():.4f} | Mean Reward: {rewards.mean().item():.3f}")
-            
+
+            # Scalar logs
             writer.add_scalar("train/loss", loss.item(), step)
             writer.add_scalar("train/reward", rewards.mean().item(), step)
             writer.add_scalar("train/gen_time", batch['gen_time'], step)
             if grad_norm is not None:
                 writer.add_scalar("train/grad_norm", grad_norm, step)
-            
-            # Additional metrics
             writer.add_scalar("train/rewards_per_prompt/mean", mean_per_prompt.mean().item(), step)
             writer.add_scalar("train/rewards_per_prompt/std", std_per_prompt.mean().item(), step)
             writer.add_scalar("train/ratios/mean", ratios.mean().item(), step)
             writer.add_scalar("train/ratios/std", ratios.std().item(), step)
             writer.add_scalar("train/kl/mean", kl.mean().item(), step)
             writer.add_scalar("train/kl/std", kl.std().item(), step)
+            writer.add_scalar("train/pg_loss/mean", pg_loss.mean().item(), step)
+            writer.add_scalar("train/pg_loss/std", pg_loss.std().item(), step)
+            writer.add_scalar("train/advantages_per_prompt/mean", advantages_per_prompt.mean().item(), step)
+            writer.add_scalar("train/advantages_per_prompt/std", advantages_per_prompt.std().item(), step)
+
+            # Completion length stats
+            completion_lengths = torch.tensor([len(x) for x in ans_token_ids], dtype=torch.float32)
+            writer.add_scalar("gen/completion/mean_length", completion_lengths.mean().item(), step)
+            writer.add_scalar("gen/completion/min_length", completion_lengths.min().item(), step)
+            writer.add_scalar("gen/completion/max_length", completion_lengths.max().item(), step)
+
+            # Reward stats
+            rewards_tensor = torch.tensor(batch['rewards'])
+            writer.add_scalar("gen/rewards_mean", rewards_tensor.mean().item(), step)
+            writer.add_scalar("gen/rewards_std", rewards_tensor.std().item(), step)
+            writer.add_scalar("gen/rewards_min", rewards_tensor.min().item(), step)
+            writer.add_scalar("gen/rewards_max", rewards_tensor.max().item(), step)
+
+            # Table logging
+            prompts = batch['prompts']
+            answers = batch['answers']
+            num_prompts_in_batch = len(prompts)
+            num_rollouts_per_prompt = len(answers) // num_prompts_in_batch
+            rewards_per_prompt_log = rewards_tensor.view(num_prompts_in_batch, num_rollouts_per_prompt)
+            mean_per_prompt_log = rewards_per_prompt_log.mean(dim=1, keepdim=True)
+            std_per_prompt_log = rewards_per_prompt_log.std(dim=1, keepdim=True)
+            advantages_for_logging = (rewards_per_prompt_log - mean_per_prompt_log) / (std_per_prompt_log + 1e-4)
+            advantages_for_logging = advantages_for_logging.flatten()
+
+            for p_idx in range(num_prompts_in_batch):
+                prompt_text = prompts[p_idx]
+                S = f"Prompt: {prompt_text}<br><br>"
+                for r_idx in range(num_rollouts_per_prompt):
+                    ans_idx = p_idx * num_rollouts_per_prompt + r_idx
+                    answer_text = answers[ans_idx]
+                    reward_val = rewards_tensor[ans_idx].item()
+                    adv_val = advantages_for_logging[ans_idx].item()
+                    S += f"Answer: {answer_text}<br><br>"
+                    S += f"Reward: {reward_val}<br><br>"
+                    S += f"Advantage: {adv_val}<br><br>"
+                writer.add_text("generations", S, step)
 
     print(f"[GRPO] Rank {extended_rank} training completed")
 

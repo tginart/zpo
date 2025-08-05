@@ -1,109 +1,80 @@
 #!/bin/bash
 #
-# Sample SLURM sbatch script for simple_GRPO/grpo_vllm_sync_ds_multi.py
+# SLURM sbatch script for simple_GRPO/aspo.py (unified distributed ASPO)
 #
-# This script requests 8 GPUs on a single node, using 7 for DeepSpeed
-# training and 1 for the vLLM actor, as designed in the Python script.
+# Requests 8 GPUs on a single node and launches `aspo.py` on all 8 ranks.
+# Rank 7 acts as the generation actor; ranks 0-6 are FSDP training workers.
 #
-# To submit this script:
-# sbatch run_grpo_slurm.sh
+# Submit with:
+#     sbatch run_aspo_slurm.sh
 
-#SBATCH --job-name=aspo_ds_multi
+#SBATCH --job-name=aspo_unified
 #SBATCH --partition=ml.p5en.48xlarge
 #SBATCH --gres=gpu:8
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1   # The deepspeed launcher manages processes
+#SBATCH --ntasks-per-node=1   # Deepspeed launcher spawns processes
 #SBATCH --time=4-00:00:00
-#SBATCH --output=slurm_logs/aspo_ds_multi_%j.out
-#SBATCH --error=slurm_logs/aspo_ds_multi_%j.err
+#SBATCH --output=slurm_logs/aspo_unified_%j.out
+#SBATCH --error=slurm_logs/aspo_unified_%j.err
 
-# Create directory for slurm logs
+# -----------------------------------------------------------------------------
+# Directory / log setup
+# -----------------------------------------------------------------------------
 mkdir -p slurm_logs
+mkdir -p logs
 
-#################################################################
-# Environment Setup
-#################################################################
+# -----------------------------------------------------------------------------
+# Environment setup
+# -----------------------------------------------------------------------------
 echo "Setting up environment..."
 conda activate simple_scpo
 cd /fsx/home/aginart/dev/rl/simple_GRPO
 
-# For reporting node info
 echo "Running on node: $(hostname)"
 scontrol show hostnames "$SLURM_JOB_NODELIST"
 
-#################################################################
-# Script Configuration
-#################################################################
-export MODEL_PATH="Qwen/Qwen2.5-1.5B-instruct"
-export TASK="length"
-export STEPS=1000
-export NUM_PROMPTS=2
-export GRADIENT_ACCUMULATION_STEPS=2
-export MAX_GEN_TOKENS=1024
-export BETA=0.04
-export CLIP_PARAM=0.2
-export LR=1e-5
-# ASPO specific parameters (defaults are placeholders, please adjust)
-export MIN_RO=7
-export MAX_RO=7
-# export K=
-# export THETA_A=
-# export MIN_LEN=
+# -----------------------------------------------------------------------------
+# Script configuration (adjust as needed)
+# -----------------------------------------------------------------------------
+MODEL_PATH="Qwen/Qwen2.5-1.5B-instruct"
+TASK="length"
+STEPS=1000
+NUM_ROLLOUTS=14          # per prompt
+MAX_GEN_TOKENS=1024
+BETA=0.2
+CLIP_PARAM=0.2
+LR=1e-6
+MIN_LEN=16
+THETA_ADV=-999999.9      # always-split behaviour
+MASTER_ADDR="localhost"
+MASTER_PORT="29500"
 
-# The python script is currently hardcoded for 7 training GPUs via the
-# `num_train_devices = 7` variable. This bash script is configured to
-# match that (7 train + 1 actor = 8 total GPUs).
-# If you change the --gres value, you MUST update the python script.
-NUM_GPUS_REQUESTED=${SLURM_GPUS_ON_NODE:-$(nvidia-smi -L | wc -l)}
-
-# We expect one less GPU for training than total requested
-NUM_TRAIN_GPUS=$((NUM_GPUS_REQUESTED - 1))
-
-# The last GPU is for the actor
-ACTOR_GPU_ID=$((NUM_GPUS_REQUESTED - 1))
-
-# Create the list of GPU IDs for DeepSpeed (e.g., "0,1,2,3,4,5,6")
-TRAIN_GPU_IDS=$(seq -s, 0 $((NUM_TRAIN_GPUS - 1)))
-
-# Path to the script to run
-PYTHON_SCRIPT="aspo_vllm_sync_ds_multi.py"
-
-#################################################################
-# Launching the job
-#################################################################
 echo "#################################################################"
-echo "Starting DeepSpeed job..."
-echo "Total GPUs requested: ${NUM_GPUS_REQUESTED}"
-echo "GPUs for DeepSpeed training: ${NUM_TRAIN_GPUS} (IDs: ${TRAIN_GPU_IDS})"
-echo "GPU for vLLM Actor: ${ACTOR_GPU_ID}"
-echo "Python script: ${PYTHON_SCRIPT}"
-echo "Model: ${MODEL_PATH}"
-echo "Task: ${TASK}"
-echo "Steps: ${STEPS}"
+echo "Starting DeepSpeed unified ASPO job..."
+echo "Model:      $MODEL_PATH"
+echo "Task:       $TASK"
+echo "Steps:      $STEPS"
+echo "Prompts:    $NUM_PROMPTS  |  Rollouts: $NUM_ROLLOUTS"
+echo "Master:     $MASTER_ADDR:$MASTER_PORT"
 echo "#################################################################"
 
-
-
-# The `deepspeed` command will launch `NUM_TRAIN_GPUS` processes.
-# The `--include` flag tells deepspeed which GPUs to use on `localhost`.
-# The python script (rank 0) will then launch the actor process on the `ACTOR_GPU_ID`.
-deepspeed --include localhost:${TRAIN_GPU_IDS} \
-    ${PYTHON_SCRIPT} \
-    --actor_gpu ${ACTOR_GPU_ID} \
-    --train_gpus ${NUM_TRAIN_GPUS} \
-    --model_path "${MODEL_PATH}" \
-    --task "${TASK}" \
-    --steps ${STEPS} \
-    --num_prompts ${NUM_PROMPTS} \
-    --gradient_accumulation_steps ${GRADIENT_ACCUMULATION_STEPS} \
-    --max_gen_tokens ${MAX_GEN_TOKENS} \
-    --beta ${BETA} \
-    --clip_param ${CLIP_PARAM} \
-    --lr ${LR} \
-    --min_ro ${MIN_RO} \
-    --max_ro ${MAX_RO}
-    # --k ${K} \
-    # --theta_a ${THETA_A} \
-    # --min_len ${MIN_LEN}
+# -----------------------------------------------------------------------------
+# Launch – all GPUs 0-7 (actor on rank 7)
+# -----------------------------------------------------------------------------
+deepspeed --include localhost:0,1,2,3,4,5,6,7 aspo.py \
+    --model_path "$MODEL_PATH" \
+    --task "$TASK" \
+    --steps $STEPS \
+    --num_rollouts $NUM_ROLLOUTS \
+    --max_gen_tokens $MAX_GEN_TOKENS \
+    --beta $BETA \
+    --clip_param $CLIP_PARAM \
+    --lr $LR \
+    --min_len $MIN_LEN \
+    --theta_adv $THETA_ADV \
+    --master_addr "$MASTER_ADDR" \
+    --master_port "$MASTER_PORT" \
+    --job_id "$SLURM_JOB_ID" \
+    > logs/aspo_${SLURM_JOB_ID}.log 2>&1
 
 echo "Job finished."
