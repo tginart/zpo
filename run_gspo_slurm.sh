@@ -1,21 +1,21 @@
 #!/bin/bash
 #
-# SLURM sbatch script for simple_GRPO/grpo.py (unified distributed GRPO)
+# SLURM sbatch script for simple_GRPO/gspo.py (unified distributed GSPO)
 #
-# This script requests 8 GPUs on a single node and launches grpo.py on all 8,
+# This script requests 8 GPUs on a single node and launches gspo.py on all 8,
 # with rank 7 acting as the actor (no separate actor process).
 #
 # To submit this script:
-# sbatch run_grpo_slurm.sh
+# sbatch run_gspo_slurm.sh
 
-#SBATCH --job-name=grpo_unified
+#SBATCH --job-name=gspo_unified
 #SBATCH --partition=ml.p5en.48xlarge
 #SBATCH --gres=gpu:8
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1   # The deepspeed launcher manages processes
 #SBATCH --time=4-00:00:00
-#SBATCH --output=slurm_logs/grpo_unified_%j.out
-#SBATCH --error=slurm_logs/grpo_unified_%j.err
+#SBATCH --output=slurm_logs/gspo_unified_%j.out
+#SBATCH --error=slurm_logs/gspo_unified_%j.err
 
 # Create directory for slurm logs and training logs
 mkdir -p slurm_logs
@@ -48,15 +48,15 @@ MASTER_ADDR="localhost"
 MASTER_PORT="29500"
 
 echo "#################################################################"
-echo "Starting DeepSpeed unified GRPO job..."
+echo "Starting DeepSpeed unified GSPO job..."
 echo "Model: $MODEL_PATH"
 echo "Task: $TASK"
 echo "Steps: $STEPS"
 echo "Master: $MASTER_ADDR:$MASTER_PORT"
 echo "#################################################################"
 
-# Launch unified GRPO script on all GPUs 0-7 (including actor on rank 7)
-deepspeed --include localhost:0,1,2,3,4,5,6,7 grpo.py \
+# Launch unified GSPO script on all GPUs 0-7 (including actor on rank 7)
+deepspeed --include localhost:0,1,2,3,4,5,6,7 gspo.py \
     --model_path "$MODEL_PATH" \
     --task "$TASK" \
     --steps $STEPS \
@@ -70,6 +70,6 @@ deepspeed --include localhost:0,1,2,3,4,5,6,7 grpo.py \
     --master_addr "$MASTER_ADDR" \
     --master_port "$MASTER_PORT" \
     --job_id "$SLURM_JOB_ID" \
-    > logs/grpo_${SLURM_JOB_ID}.log 2>&1
+    > logs/gspo_${SLURM_JOB_ID}.log 2>&1
 
-echo "Job finished."
+echo "Job finished." 
