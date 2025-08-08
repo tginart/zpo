@@ -184,7 +184,11 @@ def generate_rollouts_from_segment(segment: Segment, num_rollouts: int, item, mo
     ans_token_ids = full_sequences_ids[:, prompt_len:]
     answers = tokenizer.batch_decode(ans_token_ids, skip_special_tokens=True)
 
-    rewards = reward_fn(answers, items=[item] * len(answers))
+    # Compute rewards on the full rollout completion relative to the ROOT prompt
+    ans_token_ids_full_from_root = full_sequences_ids[:, prompt_len_root:]
+    answers_full = tokenizer.batch_decode(ans_token_ids_full_from_root, skip_special_tokens=True)
+
+    rewards = reward_fn(answers_full, items=[item] * len(answers_full))
 
     gen_logits = torch.stack(outputs.scores, dim=1)  # (num_rollouts, gen_len, vocab)
     gen_log_softmax = torch.log_softmax(gen_logits, dim=-1)
@@ -218,7 +222,8 @@ def generate_rollouts_from_segment(segment: Segment, num_rollouts: int, item, mo
             "ref_logps": ref_logps[j].cpu().tolist(),
             "ans_token_ids": gen_part.cpu().tolist(),
             "prefix_len": prompt_len,
-            "answer": answers[j],
+            # Log the full completion (from root prompt) for clarity
+            "answer": answers_full[j],
             "prompt": item["prompt"][0]["content"] if isinstance(item["prompt"], list) else item["prompt"],
         })
     return rollouts
@@ -229,6 +234,9 @@ def split_segments(root_seg: Segment, item, model_gen, model_ref, tokenizer, rew
     all_rollouts = []
     for _ in range(4):
         leaves = [s for s in get_all_segments(root_seg) if s.is_leaf and s.length >= 2 * MIN_LEN_CONST]
+        # print leaves
+        print(f"get all segments: {[s.length for s in get_all_segments(root_seg)]}")
+        print(f"split_segments: leaves: {[s.length for s in leaves]}")
         rewards_vals = [s.mean for s in leaves if s.rollout_count > 0]
         global_mean = sum(rewards_vals) / len(rewards_vals) if rewards_vals else 0.0
         global_std = torch.tensor(rewards_vals).std().item() if len(rewards_vals) > 1 else 1.0
@@ -239,11 +247,24 @@ def split_segments(root_seg: Segment, item, model_gen, model_ref, tokenizer, rew
                 s.advantage = float('-inf')
         candidates = [s for s in leaves if s.advantage >= THETA_A_CONST]
         if not candidates:
-            break
+            # No candidate segments: fallback to de novo rollouts from root
+            print(f"split_segments: no candidates to split, generating de novo rollouts from root")
+            rollouts = generate_rollouts_from_segment(
+                root_seg, num_rollouts_split, item, model_gen, model_ref, tokenizer, reward_fn, max_gen_tokens, prompt_len_root, device
+            )
+            for rollout in rollouts:
+                new_seg = Segment(rollout["actions"], parent=root_seg)
+                root_seg.children.append(new_seg)
+                new_seg.propagate_reward(rollout["reward"])
+                all_rollouts.append(rollout)
+            continue
         seg_to_split = max(candidates, key=lambda s: s.advantage)
         split_idx = find_entropy_split(seg_to_split, MIN_LEN_CONST)
         if split_idx is None:
-            break
+            assert False, (
+                f"split_segments: find_entropy_split returned None for segment length {seg_to_split.length} "
+                f"(min_len={MIN_LEN_CONST})"
+            )
         child = seg_to_split.split(split_idx)
         rollouts = generate_rollouts_from_segment(child, num_rollouts_split, item, model_gen, model_ref, tokenizer, reward_fn, max_gen_tokens, prompt_len_root, device)
         for rollout in rollouts:
@@ -308,14 +329,13 @@ def collect_explore_batch(model_gen, model_ref, tokenizer, reward_fn, task_items
 
     rollouts = initial_rollouts + split_segments(root_seg, item, model_gen, model_ref, tokenizer, reward_fn, max_gen_tokens, prompt_len_root, device)
 
-    # Ensure we have exactly `num_rollouts_total` rollouts if requested
+    # Debug: ensure we produced exactly the requested number of rollouts
     if num_rollouts_total is not None:
-        if len(rollouts) > num_rollouts_total:
-            # Truncate extra rollouts
-            assert False, "num_rollouts_total is not None and len(rollouts) > num_rollouts_total"
-        elif len(rollouts) < num_rollouts_total:
-            # Pad by sampling with replacement from existing rollouts to avoid under-sized batches
-            assert False, "num_rollouts_total is not None and len(rollouts) < num_rollouts_total"
+        assert len(rollouts) == num_rollouts_total, (
+            f"collect_explore_batch: expected {num_rollouts_total} rollouts but got {len(rollouts)}. "
+            f"Parameters: min_len={MIN_LEN_CONST}, num_rollouts_initial={num_rollouts_initial}, "
+            f"num_rollouts_split={num_rollouts_split}. Early termination likely."
+        )
 
     return construct_training_batch(rollouts, tokenizer)
 
@@ -1127,6 +1147,8 @@ def main():
             writer.add_scalar("gen/rewards_max", rewards_tensor.max().item(), step)
             # Table logging (same as grpo.py)
             prompts = batch['prompts']
+            sequences_list = batch['sequences']
+            prompt_lens = batch['prompt_lens']
             answers = batch['answers']
             num_prompts_in_batch = len(prompts)
             num_rollouts_per_prompt = len(answers) // num_prompts_in_batch
@@ -1140,10 +1162,13 @@ def main():
                 S = f"Prompt: {prompt_text}<br><br>"
                 for r_idx in range(num_rollouts_per_prompt):
                     ans_idx = p_idx * num_rollouts_per_prompt + r_idx
-                    answer_text = answers[ans_idx]
+                    prefix_ids = sequences_list[ans_idx][:prompt_lens[ans_idx]]
+                    prefix_text = tokenizer.decode(prefix_ids, skip_special_tokens=True)
+                    completion_text = answers[ans_idx]
                     reward_val = rewards_tensor[ans_idx].item()
                     adv_val = advantages_for_logging[ans_idx].item()
-                    S += f"Answer: {answer_text}<br><br>"
+                    S += f"Prefix: {prefix_text}<br><br>"
+                    S += f"Completion: {completion_text}<br><br>"
                     S += f"Reward: {reward_val}<br><br>"
                     S += f"Advantage: {adv_val}<br><br>"
                 writer.add_text("generations", S, step)
