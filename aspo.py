@@ -139,7 +139,18 @@ def find_entropy_split(segment: Segment, min_len: int) -> Optional[int]:
     # else:
     #     # print(f"[find_entropy_split] No valid split found.")
     # print(f"[find_entropy_split] All candidate entropies: {[(i, f'{e:.4f}') for i, e in entropies]}")
-    return split_idx if split_idx != -1 else None
+    if split_idx != -1:
+        parent_prefix_len = len(segment.parent.prefix_ids) if segment.parent else 0
+        left_len = split_idx
+        right_len = segment.length - split_idx
+        new_total_prefix_len = parent_prefix_len + left_len
+        print(
+            f"[find_entropy_split] Selected split index {split_idx} | "
+            f"left_len={left_len}, right_len={right_len}, "
+            f"prev_prefix_len={parent_prefix_len}, new_total_prefix_len={new_total_prefix_len}"
+        )
+        return split_idx
+    return None
 
 # ----------------------------------------------------------------------------------
 # Explore-only splitting helpers (ported from aspo_vllm_async_simplified)
@@ -166,6 +177,8 @@ def generate_rollouts_from_segment(segment: Segment, num_rollouts: int, item, mo
     remaining_budget = max_gen_tokens - already_generated
     new_max_gen_tokens = max(1, remaining_budget)
 
+    print(f"inputs: {tokenizer.batch_decode(inputs, skip_special_tokens=True)}")
+
 
     with torch.no_grad():
         outputs = model_gen.generate(
@@ -181,12 +194,27 @@ def generate_rollouts_from_segment(segment: Segment, num_rollouts: int, item, mo
             return_dict_in_generate=True,
         )
     full_sequences_ids = outputs.sequences  # (num_rollouts, seq_len)
-    ans_token_ids = full_sequences_ids[:, prompt_len:]
+    ans_token_ids = full_sequences_ids[:, prompt_len:] # (num_rollouts, gen_len)
     answers = tokenizer.batch_decode(ans_token_ids, skip_special_tokens=True)
 
     # Compute rewards on the full rollout completion relative to the ROOT prompt
     ans_token_ids_full_from_root = full_sequences_ids[:, prompt_len_root:]
     answers_full = tokenizer.batch_decode(ans_token_ids_full_from_root, skip_special_tokens=True)
+
+    # print(f"prompt len: {prompt_len}")
+    # print(f"prompt len root: {prompt_len_root}")
+    # print(f"already generated: {already_generated}")
+    # print(f"remaining budget: {remaining_budget}")
+    # print(f"new max gen tokens: {new_max_gen_tokens}")
+
+    # convert tokens to text and print
+    #print(f"inputs: {tokenizer.batch_decode(inputs, skip_special_tokens=True)}")
+    # just the outputs / completions from this round
+    # print(f"outputs: {answers}")
+    #print(f"answers_full: {answers_full}")
+    #print(f"answers: {answers}")
+
+
 
     rewards = reward_fn(answers_full, items=[item] * len(answers_full))
 
@@ -222,8 +250,8 @@ def generate_rollouts_from_segment(segment: Segment, num_rollouts: int, item, mo
             "ref_logps": ref_logps[j].cpu().tolist(),
             "ans_token_ids": gen_part.cpu().tolist(),
             "prefix_len": prompt_len,
-            # Log the full completion (from root prompt) for clarity
-            "answer": answers_full[j],
+            # Store only the completion relative to this segment prefix
+            "answer": answers[j],
             "prompt": item["prompt"][0]["content"] if isinstance(item["prompt"], list) else item["prompt"],
         })
     return rollouts
@@ -265,11 +293,22 @@ def split_segments(root_seg: Segment, item, model_gen, model_ref, tokenizer, rew
                 f"split_segments: find_entropy_split returned None for segment length {seg_to_split.length} "
                 f"(min_len={MIN_LEN_CONST})"
             )
+        # Detailed logging for the actual split that will be performed
+        parent_prefix_len = len(seg_to_split.parent.prefix_ids) if seg_to_split.parent else 0
+        left_len = split_idx
+        right_len = seg_to_split.length - split_idx
+        new_total_prefix_len = parent_prefix_len + left_len
+        print(
+            f"split_segments: Performing split at index {split_idx} | "
+            f"left_len={left_len}, right_len={right_len}, "
+            f"prev_prefix_len={parent_prefix_len}, new_total_prefix_len={new_total_prefix_len}"
+        )
         child = seg_to_split.split(split_idx)
-        rollouts = generate_rollouts_from_segment(child, num_rollouts_split, item, model_gen, model_ref, tokenizer, reward_fn, max_gen_tokens, prompt_len_root, device)
+        # Generate from the LEFT prefix (seg_to_split) after split, not from the right-suffix child
+        rollouts = generate_rollouts_from_segment(seg_to_split, num_rollouts_split, item, model_gen, model_ref, tokenizer, reward_fn, max_gen_tokens, prompt_len_root, device)
         for rollout in rollouts:
-            new_seg = Segment(rollout["actions"], parent=child)
-            child.children.append(new_seg)
+            new_seg = Segment(rollout["actions"], parent=seg_to_split)
+            seg_to_split.children.append(new_seg)
             new_seg.propagate_reward(rollout["reward"])
             all_rollouts.append(rollout)
     return all_rollouts
@@ -307,10 +346,9 @@ def construct_training_batch(rollouts: list, tokenizer):
     }
 
 
-def collect_explore_batch(model_gen, model_ref, tokenizer, reward_fn, task_items, num_rollouts_total, max_gen_tokens, device):
+def collect_explore_batch(model_gen, model_ref, tokenizer, reward_fn, task_items, num_rollouts_total, max_gen_tokens, device, system_prompt):
     """Sample a prompt and generate an explore-only batch via splitting."""
     item = random.choice(task_items)
-    system_prompt = "You are a helpful assistant."
     user_prompt = item["prompt"][0]["content"] if isinstance(item["prompt"], list) else item["prompt"]
     tip_text = tokenizer.apply_chat_template(
         [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
@@ -345,6 +383,7 @@ def collect_explore_batch(model_gen, model_ref, tokenizer, reward_fn, task_items
 
 def get_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--debug", action="store_true", help="Debug mode")
     parser.add_argument("--local_rank", type=int, default=-1, help="(internal) local rank passed by launcher")
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--model_path", type=str, default="Qwen/Qwen2.5-1.5B-instruct")
@@ -389,6 +428,7 @@ beta = args.beta
 clip_param = args.clip_param
 lr = args.lr
 grad_clip = args.grad_clip
+debug = args.debug
 
 # Update explore-only constants with CLI overrides
 MIN_LEN_CONST = args.min_len
@@ -644,7 +684,7 @@ def run_actor_role(actor_rank, world_size, model_path, task_name, master_addr, m
             # Generate batch using explore-only splitting
             batch = collect_explore_batch(
                 model_gen, model_ref, tokenizer, reward_fn, task_items,
-                num_rollouts, max_gen_tokens, device
+                num_rollouts, max_gen_tokens, device, system_prompt
             )
             
             gen_time = time.time() - tic
@@ -796,7 +836,8 @@ def main():
     # We need to extend this to communicate with rank 7 (the actor)
     
     # Set up environment for distributed training
-    print(f"[GRPO] Setting up environment for distributed training")
+    if debug:   
+        print(f"[GRPO] Setting up environment for distributed training")
     os.environ["MASTER_ADDR"] = args.master_addr
     os.environ["MASTER_PORT"] = args.master_port
     print(f"[GRPO] Environment set: MASTER_ADDR={os.environ['MASTER_ADDR']} MASTER_PORT={os.environ['MASTER_PORT']}")
@@ -884,22 +925,27 @@ def main():
             writer.add_text(f"args/{k}", str(v))
 
     # Wait for actor to be ready
-    print(f"[GRPO] Rank {extended_rank} waiting for actor to be ready (barrier)...")
+    if debug:
+        print(f"[GRPO] Rank {extended_rank} waiting for actor to be ready (barrier)...")
     dist.barrier()  # Actor will join this barrier when ready
-    print(f"[GRPO] Rank {extended_rank} actor is ready, starting training loop")
+    if debug:
+        print(f"[GRPO] Rank {extended_rank} actor is ready, starting training loop")
 
     # Training loop
     for step in trange(1, args.steps + 1, desc="Training Steps", disable=(extended_rank != 0)):
         
         # Only rank 0 gets the full state dict and sends tensors to actor
         if extended_rank == 0:
-            print(f"[GRPO] Rank {extended_rank}: Getting full state_dict for step {step}...")
+            if debug:
+                print(f"[GRPO] Rank {extended_rank}: Getting full state_dict for step {step}...")
             # Use full state dict on rank 0 - FSDP will gather from all ranks
             with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
                 full_state_dict = model.state_dict()
-            print(f"[GRPO] Rank {extended_rank}: Got full state_dict for step {step}")
+            if debug:
+                print(f"[GRPO] Rank {extended_rank}: Got full state_dict for step {step}")
             
-            print(f"[GRPO] Rank {extended_rank}: Sending state dict to actor...")
+            if debug:
+                print(f"[GRPO] Rank {extended_rank}: Sending state dict to actor...")
             
             # Send control message first
             send_metadata({"type": "STATE_DICT"}, dst_rank=7, tag=step*100)
@@ -907,23 +953,29 @@ def main():
             # Send state dict to actor (rank 7)
             broadcast_state_dict(full_state_dict, src_rank=0, dst_rank=7, tag_base=step*100+10)
             
-            print(f"[GRPO] Rank {extended_rank}: Sent state dict to actor")
+            if debug:
+                print(f"[GRPO] Rank {extended_rank}: Sent state dict to actor")
         else:
             # Other ranks just participate in the collective gather
-            print(f"[GRPO] Rank {extended_rank}: Participating in state_dict gather for step {step}")
+            if debug:
+                print(f"[GRPO] Rank {extended_rank}: Participating in state_dict gather for step {step}")
             with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
                 model.state_dict()  # Participate in collective but don't use result
-            print(f"[GRPO] Rank {extended_rank}: Participated in state_dict gather for step {step}")
+            if debug:
+                print(f"[GRPO] Rank {extended_rank}: Participated in state_dict gather for step {step}")
         
         # Only rank 0 waits for acknowledgment (actor will send it after collecting all shards)
         if extended_rank == 0:
-            print(f"[GRPO] Step {step}: Waiting for ack from actor...")
+            if debug:   
+                print(f"[GRPO] Step {step}: Waiting for ack from actor...")
             ack = recv_metadata(src_rank=7, tag=step*100+99)  # Use offset tag for ack
-            print(f"[GRPO] Step {step}: Got ack: {ack}")
+            if debug:
+                print(f"[GRPO] Step {step}: Got ack: {ack}")
             assert ack["status"] == "OK", "Actor failed to update weights"
             
             # Request batch generation
-            print(f"[GRPO] Step {step}: Requesting batch from actor...")
+            if debug:
+                print(f"[GRPO] Step {step}: Requesting batch from actor...")
             gen_msg = {
                 "type": "GENERATE", 
                 "num_rollouts": num_rollouts,
@@ -931,18 +983,25 @@ def main():
                 "max_gen_tokens": max_gen_tokens
             }
             send_metadata(gen_msg, dst_rank=7, tag=step*100+5)
-            print(f"[GRPO] Step {step}: Sent batch request, waiting for batch...")
+            if debug:
+                print(f"[GRPO] Step {step}: Sent batch request, waiting for batch...")
             
-            # Receive batch using tensor communication
-            print(f"[GRPO] Step {step}: Receiving batch from actor...")
+            if debug:
+                print(f"[GRPO] Step {step}: Receiving batch from actor...")
             
             # Receive shapes and metadata first
+            # shapes:
+            #   - sequences: [B, S] where B=num_prompts*num_rollouts, S=max sequence length
+            #   - rewards: [B]
+            #   - gen_logps: [B, G] where G=max generated length per sample
+            #   - ref_logps: [B, G]
             batch_info = recv_metadata(src_rank=7, tag=step*100+20)
             shapes = batch_info["shapes"]
             metadata = batch_info["metadata"]
             
             # Receive tensors
             device = torch.cuda.current_device()
+            # Allocate receive buffers using advertised shapes
             sequences = torch.empty(shapes["sequences"], dtype=torch.long, device=device)
             rewards = torch.empty(shapes["rewards"], dtype=torch.float32, device=device)
             gen_logps = torch.empty(shapes["gen_logps"], dtype=torch.float32, device=device)
@@ -954,6 +1013,12 @@ def main():
             dist.recv(ref_logps, src=7, tag=step*100+33)
             
             # Reconstruct batch dict
+            # Notes on structure after .tolist():
+            #   - sequences: List[List[int]] of shape [B, S]
+            #   - rewards: List[float] of length B
+            #   - gen_logps/ref_logps: List[List[float]] of shape [B, G]
+            #   - prompt_lens: List[int] length B (per-sample prompt token counts)
+            #   - ans_token_ids: List[List[int]] length B (per-sample generated token ids, len varies ≤ G)
             batch = {
                 "sequences": sequences.cpu().tolist(),
                 "rewards": rewards.cpu().tolist(),
@@ -966,9 +1031,11 @@ def main():
                 "gen_time": metadata["gen_time"]
             }
             
-            print(f"[GRPO] Step {step}: Received batch from actor")
+            if debug:
+                print(f"[GRPO] Step {step}: Received batch from actor")
         else:
-            print(f"[GRPO] Rank {extended_rank}: Waiting for batch broadcast in step {step}")
+            if debug:
+                print(f"[GRPO] Rank {extended_rank}: Waiting for batch broadcast in step {step}")
             batch = None
 
         # Broadcast batch to all training ranks using tensor communication
@@ -976,12 +1043,17 @@ def main():
         
         if extended_rank == 0:
             # Rank 0 converts batch to tensors and broadcasts
+            # Tensor shapes:
+            #   sequences: [B, S] long
+            #   rewards: [B] float32
+            #   gen_old/ref_logps: [B, G] float32
             sequences = torch.tensor(batch["sequences"], dtype=torch.long, device=device)
             rewards = torch.tensor(batch["rewards"], dtype=torch.float32, device=device)
             gen_old = torch.tensor(batch["gen_logps"], dtype=torch.float32, device=device)
             ref_logps = torch.tensor(batch["ref_logps"], dtype=torch.float32, device=device)
             
             # Broadcast metadata using small object
+            # shapes captured here allow receivers to pre-allocate exact tensor sizes
             metadata = {
                 "prompt_lens": batch["prompt_lens"],
                 "ans_token_ids": batch["ans_token_ids"],
@@ -1011,6 +1083,7 @@ def main():
             shapes = metadata["shapes"]
             
             # Create tensors with the correct shapes from metadata
+            # sequences: [B, S], rewards: [B], gen_old/ref_logps: [B, G]
             sequences = torch.empty(shapes["sequences"], dtype=torch.long, device=device)
             rewards = torch.empty(shapes["rewards"], dtype=torch.float32, device=device)
             gen_old = torch.empty(shapes["gen_old"], dtype=torch.float32, device=device)
@@ -1023,6 +1096,7 @@ def main():
             dist.broadcast(ref_logps, src=0, group=trainer_group)
         
         # Convert to expected dtypes
+        # rewards/gen_old/ref_logps become bfloat16 for compute; shapes remain [B] and [B, G]
         rewards = rewards.to(torch.bfloat16)
         gen_old = gen_old.to(torch.bfloat16)
         ref_logps = ref_logps.to(torch.bfloat16)
@@ -1031,16 +1105,31 @@ def main():
         ans_token_ids = metadata["ans_token_ids"]
 
         # Compute advantages per prompt
-        num_prompts_in_batch = len(metadata["prompts"])
+        # B = N * R (N=num_prompts_in_batch, R=num_rollouts_per_prompt)
+        num_prompts_in_batch = len(set(metadata["prompts"]))
         num_rollouts_per_prompt = len(rewards) // num_prompts_in_batch
+        # rewards_per_prompt: [N, R]
         rewards_per_prompt = rewards.view(num_prompts_in_batch, num_rollouts_per_prompt)
+        # mean_per_prompt/std_per_prompt: [N, 1]; advantages_per_prompt: [N, R]
         mean_per_prompt = rewards_per_prompt.mean(dim=1, keepdim=True)
         std_per_prompt = rewards_per_prompt.std(dim=1, keepdim=True)
         advantages_per_prompt = (rewards_per_prompt - mean_per_prompt) / (std_per_prompt + 1e-4)
         # Use overall batch statistics for policy gradient
+        # advantages: [B]
         adv_mean = rewards.mean()
         adv_std = rewards.std()
         advantages = (rewards - adv_mean) / (adv_std + 1e-4)
+        if extended_rank == 0:
+            # print various compute advantages quantities
+            # print(f"metadata: {metadata}")
+            # print(f"num_prompts_in_batch: {num_prompts_in_batch}")
+            # print(f"num_rollouts_per_prompt: {num_rollouts_per_prompt}")
+            # print(f"rewards_per_prompt: {rewards_per_prompt}")
+            # print(f"mean_per_prompt: {mean_per_prompt}")
+            # print(f"std_per_prompt: {std_per_prompt}")
+            # print(f"advantages_per_prompt: {advantages_per_prompt}")
+            # print(f"adv_mean: {adv_mean}")
+            pass
 
         # Micro-batch training loop
         num_micro_batches = total_batch_size // args.micro_batch_size
@@ -1051,6 +1140,13 @@ def main():
         for mb_idx in range(num_micro_batches):
             start = mb_idx * args.micro_batch_size
             end = start + args.micro_batch_size
+            # Per-micro-batch views
+            #   mb_sequences: [mb, S]
+            #   mb_rewards: [mb]
+            #   mb_gen_old/mb_ref_logps: [mb, G]
+            #   mb_prompt_lens: List[int] length mb
+            #   mb_ans_token_ids: List[List[int]] length mb
+            #   mb_advantages: [mb]
             mb_sequences = sequences[start:end]
             mb_rewards = rewards[start:end]
             mb_gen_old = gen_old[start:end]
@@ -1060,34 +1156,39 @@ def main():
             mb_advantages = advantages[start:end]
 
             # Forward pass
+            # mb_logits: [mb, S, V]; mb_full_logps: [mb, S-1]
             mb_logits = model(mb_sequences).logits
             mb_full_logps = per_token_logps(mb_logits[:, :-1, :], mb_sequences[:, 1:])
-            gen_len = mb_gen_old.shape[1]
+            gen_len = mb_gen_old.shape[1]  # target width G
             curr_logps_list = []
             for i in range(mb_full_logps.shape[0]):
                 p_len = mb_prompt_lens[i]
                 ans_len = len(mb_ans_token_ids[i])
+                # sliced_logps: [ans_len]; padded to [G]
                 sliced_logps = mb_full_logps[i, p_len - 1 : p_len - 1 + ans_len]
                 padded_logps = F.pad(sliced_logps, (0, gen_len - ans_len), 'constant', 0)
                 curr_logps_list.append(padded_logps)
-            mb_curr_logps = torch.stack(curr_logps_list, dim=0)
+            mb_curr_logps = torch.stack(curr_logps_list, dim=0)  # [mb, G]
 
             # PPO loss computation with numerical stability
+            # Shapes below are all [mb, G] unless noted
             ratio_diff = torch.clamp(mb_curr_logps - mb_gen_old.detach(), min=-20.0, max=20.0)
             kl_diff = torch.clamp(mb_ref_logps - mb_curr_logps, min=-20.0, max=20.0)
             mb_ratios = torch.exp(ratio_diff)
             mb_clipped = torch.clamp(mb_ratios, 1 - clip_param, 1 + clip_param)
-            mb_advantages = mb_advantages.unsqueeze(-1)
+            mb_advantages = mb_advantages.unsqueeze(-1)  # [mb, 1]
             mb_pg_loss = -torch.min(mb_ratios * mb_advantages, mb_clipped * mb_advantages)
             mb_kl = torch.exp(kl_diff) - kl_diff - 1
             mb_per_tok_loss = mb_pg_loss + beta * mb_kl
 
             # Create mask for loss computation
             # Use gen_len to match the width of mb_per_tok_loss
+            # mask: [mb, G] with 1.0 over valid tokens and 0.0 over padding
             mask = torch.zeros(len(mb_ans_token_ids), gen_len, device=device, dtype=torch.float32)
             for i, tokens in enumerate(mb_ans_token_ids):
                 mask[i, :len(tokens)] = 1.0
 
+            # Per-sample reduction over tokens → [mb], then mean over micro-batch → scalar
             mb_loss = ((mb_per_tok_loss * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)).mean()
             mb_loss = mb_loss / gradient_accumulation_steps
             mb_loss.backward()
@@ -1119,22 +1220,27 @@ def main():
             writer.add_scalar("train/gen_time", batch['gen_time'], step)
             if grad_norm is not None:
                 writer.add_scalar("train/grad_norm", grad_norm, step)
-            # Rewards per prompt
-            rewards_tensor = torch.tensor(batch['rewards'])
-            mean_per_prompt = rewards_tensor.view(num_prompts_in_batch, num_rollouts_per_prompt).mean(dim=1, keepdim=True)
-            std_per_prompt = rewards_tensor.view(num_prompts_in_batch, num_rollouts_per_prompt).std(dim=1, keepdim=True)
-            writer.add_scalar("train/rewards_per_prompt/mean", mean_per_prompt.mean().item(), step)
-            writer.add_scalar("train/rewards_per_prompt/std", std_per_prompt.mean().item(), step)
+            # Rewards per prompt (reuse tensors and grouping computed above)
+            rewards_tensor = rewards.detach().float().cpu()
+            prompts = metadata['prompts']
+            answers = batch['answers']
+            # Reuse precomputed group sizes and per-prompt stats; move small stats to CPU for logging
+            mean_per_prompt_cpu = mean_per_prompt.detach().float().cpu()
+            std_per_prompt_cpu = std_per_prompt.detach().float().cpu()
+            writer.add_scalar("train/rewards_per_prompt/mean", mean_per_prompt_cpu.mean().item(), step)
+            writer.add_scalar("train/rewards_per_prompt/std", std_per_prompt_cpu.mean().item(), step)
             writer.add_scalar("train/ratios/mean", ratios_all.mean().item(), step)
             writer.add_scalar("train/ratios/std", ratios_all.std().item(), step)
             writer.add_scalar("train/kl/mean", kl_all.mean().item(), step)
             writer.add_scalar("train/kl/std", kl_all.std().item(), step)
             writer.add_scalar("train/pg_loss/mean", pg_loss_all.mean().item(), step)
             writer.add_scalar("train/pg_loss/std", pg_loss_all.std().item(), step)
-            # Advantages per prompt
-            advantages_per_prompt = (rewards_tensor.view(num_prompts_in_batch, num_rollouts_per_prompt) - mean_per_prompt) / (std_per_prompt + 1e-4)
-            writer.add_scalar("train/advantages_per_prompt/mean", advantages_per_prompt.mean().item(), step)
-            writer.add_scalar("train/advantages_per_prompt/std", advantages_per_prompt.std().item(), step)
+            # Advantages per prompt (use CPU copies; guard against NaNs/zeros)
+            rewards_view_cpu = rewards_tensor.view(num_prompts_in_batch, num_rollouts_per_prompt)
+            std_safe_cpu = torch.where(torch.isnan(std_per_prompt_cpu) | (std_per_prompt_cpu == 0), torch.full_like(std_per_prompt_cpu, 1e-4), std_per_prompt_cpu)
+            advantages_per_prompt_cpu = (rewards_view_cpu - mean_per_prompt_cpu) / (std_safe_cpu + 1e-4)
+            writer.add_scalar("train/advantages_per_prompt/mean", advantages_per_prompt_cpu.mean().item(), step)
+            writer.add_scalar("train/advantages_per_prompt/std", advantages_per_prompt_cpu.std().item(), step)
             # Completion length stats
             completion_lengths = torch.tensor([len(x) for x in ans_token_ids], dtype=torch.float32)
             writer.add_scalar("gen/completion/mean_length", completion_lengths.mean().item(), step)
@@ -1145,18 +1251,10 @@ def main():
             writer.add_scalar("gen/rewards_std", rewards_tensor.std().item(), step)
             writer.add_scalar("gen/rewards_min", rewards_tensor.min().item(), step)
             writer.add_scalar("gen/rewards_max", rewards_tensor.max().item(), step)
-            # Table logging (same as grpo.py)
-            prompts = batch['prompts']
+            # Table logging (align with grpo.py; reuse computed stats)
             sequences_list = batch['sequences']
             prompt_lens = batch['prompt_lens']
-            answers = batch['answers']
-            num_prompts_in_batch = len(prompts)
-            num_rollouts_per_prompt = len(answers) // num_prompts_in_batch
-            rewards_per_prompt_log = rewards_tensor.view(num_prompts_in_batch, num_rollouts_per_prompt)
-            mean_per_prompt_log = rewards_per_prompt_log.mean(dim=1, keepdim=True)
-            std_per_prompt_log = rewards_per_prompt_log.std(dim=1, keepdim=True)
-            advantages_for_logging = (rewards_per_prompt_log - mean_per_prompt_log) / (std_per_prompt_log + 1e-4)
-            advantages_for_logging = advantages_for_logging.flatten()
+            advantages_for_logging = advantages_per_prompt_cpu.flatten()
             for p_idx in range(num_prompts_in_batch):
                 prompt_text = prompts[p_idx]
                 S = f"Prompt: {prompt_text}<br><br>"
@@ -1177,9 +1275,11 @@ def main():
 
     # Cleanup - send stop signal to actor (only rank 0)
     if extended_rank == 0:
-        print(f"[GRPO] Rank {extended_rank}: Sending stop signal to actor...")
+        if debug:
+            print(f"[GRPO] Rank {extended_rank}: Sending stop signal to actor...")
         send_metadata({"type": "STOP"}, dst_rank=7, tag=(args.steps+1)*100)
-        print(f"[GRPO] Rank {extended_rank}: Sent stop signal to actor")
+        if debug:
+            print(f"[GRPO] Rank {extended_rank}: Sent stop signal to actor")
     
     # Proper cleanup
     print(f"[GRPO] Rank {extended_rank} cleaning up...")

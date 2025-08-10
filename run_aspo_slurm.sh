@@ -36,15 +36,15 @@ scontrol show hostnames "$SLURM_JOB_NODELIST"
 #################################################################
 MODEL_PATH="Qwen/Qwen2.5-1.5B-instruct"
 TASK="length"
-STEPS=1000
+STEPS=2000
 NUM_ROLLOUTS=21
 NUM_PROMPTS=1
 MICRO_BATCH_SIZE=7
 GRADIENT_ACCUMULATION_STEPS=3
 MAX_GEN_TOKENS=1024
 BETA=0.01
-CLIP_PARAM=0.2
-LR=1e-6
+CLIP_PARAM=0.1
+LR=1e-5
 MIN_LEN=16                # ASPO-specific
 THETA_ADV=-999999.9       # ASPO-specific
 NUM_ROLLOUTS_INITIAL=5    # ASPO-specific
@@ -73,7 +73,7 @@ echo "Master:     $MASTER_ADDR:$MASTER_PORT"
 echo "#################################################################"
 
 # Launch unified ASPO script on all GPUs 0-7 (including actor on rank 7)
-NCCL_DEBUG=INFO deepspeed --include localhost:0,1,2,3,4,5,6,7 aspo.py \
+deepspeed --include localhost:0,1,2,3,4,5,6,7 aspo.py \
     --model_path "$MODEL_PATH" \
     --task "$TASK" \
     --steps $STEPS \
@@ -92,6 +92,6 @@ NCCL_DEBUG=INFO deepspeed --include localhost:0,1,2,3,4,5,6,7 aspo.py \
     --master_addr "$MASTER_ADDR" \
     --master_port "$MASTER_PORT" \
     --job_id "$SLURM_JOB_ID" \
-    > logs/aspo_${SLURM_JOB_ID}.log 2>&1
+    > logs/aspo_gsm8k_1_${SLURM_JOB_ID}.log 2>&1
 
 echo "Job finished."
