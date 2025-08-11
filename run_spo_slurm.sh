@@ -73,7 +73,7 @@ echo "Master:     $MASTER_ADDR:$MASTER_PORT"
 echo "#################################################################"
 
 # Launch unified ASPO script on all GPUs 0-7 (including actor on rank 7)
-deepspeed --include localhost:0,1,2,3,4,5,6,7 aspo.py \
+deepspeed --include localhost:0,1,2,3,4,5,6,7 spo.py \
     --model_path "$MODEL_PATH" \
     --task "$TASK" \
     --steps $STEPS \
