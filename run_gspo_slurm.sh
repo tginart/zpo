@@ -35,7 +35,7 @@ scontrol show hostnames "$SLURM_JOB_NODELIST"
 # Script Configuration (match run_grpo_distributed.sh)
 #################################################################
 MODEL_PATH="Qwen/Qwen2.5-1.5B-instruct"
-TASK="length"
+TASK="gsm8k"
 STEPS=2000
 NUM_ROLLOUTS=14
 NUM_PROMPTS=1
@@ -70,6 +70,6 @@ deepspeed --include localhost:0,1,2,3,4,5,6,7 gspo.py \
     --master_addr "$MASTER_ADDR" \
     --master_port "$MASTER_PORT" \
     --job_id "$SLURM_JOB_ID" \
-    > logs/gspo_gsm8k_1_${SLURM_JOB_ID}.log 2>&1
+    > logs/gspo_${TASK}_${SLURM_JOB_ID}.log 2>&1
 
 echo "Job finished." 

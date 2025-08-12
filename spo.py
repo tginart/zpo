@@ -214,8 +214,6 @@ def generate_rollouts_from_segment(segment: Segment, num_rollouts: int, item, mo
     #print(f"answers_full: {answers_full}")
     #print(f"answers: {answers}")
 
-
-
     rewards = reward_fn(answers_full, items=[item] * len(answers_full))
 
     gen_logits = torch.stack(outputs.scores, dim=1)  # (num_rollouts, gen_len, vocab)
@@ -263,8 +261,8 @@ def split_segments(root_seg: Segment, item, model_gen, model_ref, tokenizer, rew
     for _ in range(4):
         leaves = [s for s in get_all_segments(root_seg) if s.is_leaf and s.length >= 2 * MIN_LEN_CONST]
         # print leaves
-        print(f"get all segments: {[s.length for s in get_all_segments(root_seg)]}")
-        print(f"split_segments: leaves: {[s.length for s in leaves]}")
+        #print(f"get all segments: {[s.length for s in get_all_segments(root_seg)]}")
+        #print(f"split_segments: leaves: {[s.length for s in leaves]}")
         rewards_vals = [s.mean for s in leaves if s.rollout_count > 0]
         global_mean = sum(rewards_vals) / len(rewards_vals) if rewards_vals else 0.0
         global_std = torch.tensor(rewards_vals).std().item() if len(rewards_vals) > 1 else 1.0
@@ -276,7 +274,7 @@ def split_segments(root_seg: Segment, item, model_gen, model_ref, tokenizer, rew
         candidates = [s for s in leaves if s.advantage >= THETA_A_CONST]
         if not candidates:
             # No candidate segments: fallback to de novo rollouts from root
-            print(f"split_segments: no candidates to split, generating de novo rollouts from root")
+            #print(f"split_segments: no candidates to split, generating de novo rollouts from root")
             rollouts = generate_rollouts_from_segment(
                 root_seg, num_rollouts_split, item, model_gen, model_ref, tokenizer, reward_fn, max_gen_tokens, prompt_len_root, device
             )
@@ -298,11 +296,11 @@ def split_segments(root_seg: Segment, item, model_gen, model_ref, tokenizer, rew
         left_len = split_idx
         right_len = seg_to_split.length - split_idx
         new_total_prefix_len = parent_prefix_len + left_len
-        print(
-            f"split_segments: Performing split at index {split_idx} | "
-            f"left_len={left_len}, right_len={right_len}, "
-            f"prev_prefix_len={parent_prefix_len}, new_total_prefix_len={new_total_prefix_len}"
-        )
+        # print(
+        #     f"split_segments: Performing split at index {split_idx} | "
+        #     f"left_len={left_len}, right_len={right_len}, "
+        #     f"prev_prefix_len={parent_prefix_len}, new_total_prefix_len={new_total_prefix_len}"
+        # )
         child = seg_to_split.split(split_idx)
         # Generate from the LEFT prefix (seg_to_split) after split, not from the right-suffix child
         rollouts = generate_rollouts_from_segment(seg_to_split, num_rollouts_split, item, model_gen, model_ref, tokenizer, reward_fn, max_gen_tokens, prompt_len_root, device)
@@ -918,8 +916,8 @@ def main():
 
     if extended_rank == 0:
         print(f"[GRPO] Creating SummaryWriter and logging args")
-        logdir = f"runs/aspo_distributed_{args.job_id}" if args.job_id is not None else f"runs/aspo_distributed_{time.strftime('%Y%m%d-%H%M%S')}"
-        writer = SummaryWriter(logdir)
+        logdir = f"runs/spo_{args.task}_{args.job_id}" if args.job_id is not None else f"runs/spo_{args.task}_{time.strftime('%Y%m%d-%H%M%S')}"
+        writer = SummaryWriter(logdir) 
         # Log each CLI arg as a separate text entry
         for k, v in vars(args).items():
             writer.add_text(f"args/{k}", str(v))

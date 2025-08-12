@@ -8,14 +8,14 @@
 # To submit this script:
 # sbatch run_aspo_slurm.sh
 
-#SBATCH --job-name=aspo_unified
+#SBATCH --job-name=spo_unified
 #SBATCH --partition=ml.p5en.48xlarge
 #SBATCH --gres=gpu:8
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1   # The deepspeed launcher manages processes
 #SBATCH --time=4-00:00:00
-#SBATCH --output=slurm_logs/aspo_unified_%j.out
-#SBATCH --error=slurm_logs/aspo_unified_%j.err
+#SBATCH --output=slurm_logs/spo_unified_%j.out
+#SBATCH --error=slurm_logs/spo_unified_%j.err
 
 # Create directory for slurm logs and training logs
 mkdir -p slurm_logs
@@ -54,7 +54,7 @@ MASTER_PORT="29500"
 
 #################################################################
 echo "#################################################################"
-echo "Starting DeepSpeed unified ASPO job..."
+echo "Starting DeepSpeed unified SPO job..."
 echo "Model:      $MODEL_PATH"
 echo "Task:       $TASK"
 echo "Steps:      $STEPS"
@@ -72,7 +72,7 @@ echo "Num rollouts split:   $NUM_ROLLOUTS_SPLIT"
 echo "Master:     $MASTER_ADDR:$MASTER_PORT"
 echo "#################################################################"
 
-# Launch unified ASPO script on all GPUs 0-7 (including actor on rank 7)
+# Launch unified SPO script on all GPUs 0-7 (including actor on rank 7)
 deepspeed --include localhost:0,1,2,3,4,5,6,7 spo.py \
     --model_path "$MODEL_PATH" \
     --task "$TASK" \
@@ -92,6 +92,6 @@ deepspeed --include localhost:0,1,2,3,4,5,6,7 spo.py \
     --master_addr "$MASTER_ADDR" \
     --master_port "$MASTER_PORT" \
     --job_id "$SLURM_JOB_ID" \
-    > logs/aspo_gsm8k_1_${SLURM_JOB_ID}.log 2>&1
+    > logs/spo_${TASK}_${SLURM_JOB_ID}.log 2>&1
 
 echo "Job finished."

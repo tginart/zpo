@@ -525,7 +525,7 @@ def main():
 
     if extended_rank == 0:
         print(f"[GSPO] Creating SummaryWriter and logging args")
-        logdir = f"runs/gspo_distributed_{args.job_id}" if args.job_id is not None else f"runs/gspo_distributed_{time.strftime('%Y%m%d-%H%M%S')}"
+        logdir = f"runs/gspo_{args.task}_{args.job_id}" if args.job_id is not None else f"runs/gspo_{args.task}_{time.strftime('%Y%m%d-%H%M%S')}"
         writer = SummaryWriter(logdir)
         # Log each CLI arg as a separate text entry
         for k, v in vars(args).items():

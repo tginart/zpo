@@ -918,7 +918,6 @@ def main():
         sync_module_states=True,
         process_group=trainer_group,  # Use only ranks 0-6
     )
-    
     # Create optimizer
     print(f"[GRPO] Creating optimizer...")
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
@@ -927,7 +926,7 @@ def main():
 
     if extended_rank == 0:
         print(f"[GRPO] Creating SummaryWriter and logging args")
-        logdir = f"runs/gxpo_distributed_{args.job_id}" if args.job_id is not None else f"runs/gxpo_distributed_{time.strftime('%Y%m%d-%H%M%S')}"
+        logdir = f"runs/gxpo_{args.task}_{args.job_id}" if args.job_id is not None else f"runs/gxpo_{args.task}_{time.strftime('%Y%m%d-%H%M%S')}"
         writer = SummaryWriter(logdir)
         # Log each CLI arg as a separate text entry
         for k, v in vars(args).items():
